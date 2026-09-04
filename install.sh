@@ -204,8 +204,8 @@ ensure_bin_on_path() {
 disable_old_alias() {
   local rc="$TARGET_HOME/.zshrc"
   local old='alias vpn="python3 /home/isaac/apps/vpns/vpn_manager.py"'
-  [[ -f "$rc" ]] || return
-  grep -qF "$old" "$rc" || return
+  [[ -f "$rc" ]] || return 0
+  grep -qF "$old" "$rc" || return 0
   as_user sed -i "s|^${old}$|# reemplazado por vpn-tui/install.sh — # ${old}|" "$rc"
   warn "comenté el alias viejo de 'vpn' (vpn_manager.py) en $rc; abre una terminal nueva"
 }
@@ -216,8 +216,8 @@ disable_old_alias() {
 # El toggle de IPv6 ahora necesita ambos scripts (deshabilitar y habilitar).
 ipv6_script_from_db() {
   local key="$1"
-  command -v sqlite3 >/dev/null || return
-  [[ -f "$DB_PATH" ]] || return
+  command -v sqlite3 >/dev/null || return 0
+  [[ -f "$DB_PATH" ]] || return 0
   sqlite3 "$DB_PATH" "SELECT value FROM settings WHERE key = '$key'" 2>/dev/null
 }
 
