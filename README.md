@@ -29,6 +29,11 @@ en el menú de **configuración** (`c`), no en el menú principal.
   y borran desde la propia TUI (menú de config → Perfiles), con un formulario
   y un explorador de archivos (`F3`) para elegir el `.ovpn` sin teclear la
   ruta a mano.
+- **Arrastrar el `.ovpn` a la ventana funciona**: no hay drag & drop nativo en
+  una terminal, pero al soltar un archivo el emulador pega su ruta, y la zona
+  de importación la entiende venga como venga — cruda, entre comillas, con los
+  espacios escapados o como URI `file://` percent-encoded. Pegar la ruta a mano
+  (`ctrl+shift+v`) hace exactamente lo mismo.
 - **Migración automática, una sola vez**: si ya tenías un `config.toml` de la
   versión anterior, sus perfiles (incluidas las credenciales de FortiVPN) se
   importan a la base de datos la primera vez que corres `vpn`. El
@@ -164,6 +169,7 @@ ejecución.
 | `enter` | entrar / confirmar |
 | `n` / `e` / `x` | nuevo / editar / borrar perfil (en una lista de perfiles) |
 | `F3` | buscar archivo (campos de ruta, en el formulario o en General) |
+| arrastrar / `ctrl+shift+v` | soltar o pegar la ruta de un `.ovpn` en la zona de importación |
 | `tab` / `shift-tab` | siguiente / anterior campo |
 | `t` | alternar IPv6 (en la pantalla de estado de IPv6) |
 | `d` / `a` / `esc`/`n` | matar sesión seleccionada / matar todas / cancelar (sesiones OpenVPN3) |

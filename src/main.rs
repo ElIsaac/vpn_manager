@@ -10,8 +10,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use ratatui::crossterm::event::{
-    Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, KeyCode, KeyEvent,
+    KeyEventKind, KeyModifiers,
 };
+use ratatui::crossterm::execute;
 
 use app::{App, ConfigScreen, FileTarget, Focus, FormOrigin, Kind, Screen, TailscaleScreen};
 use db::Db;
@@ -154,7 +156,9 @@ fn run_tui(db: Db, target: StartupTarget) -> Result<()> {
     }
 
     let mut terminal = ratatui::init();
+    enable_bracketed_paste();
     let result = event_loop(&mut terminal, &mut app, &events);
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
 
     // Cierra lo que abrió la TUI, ya fuera de la pantalla alternativa.
@@ -171,6 +175,25 @@ fn run_tui(db: Db, target: StartupTarget) -> Result<()> {
     }
 
     result
+}
+
+/// Sin bracketed paste, soltar un archivo sobre la terminal (que el emulador
+/// traduce a pegar la ruta) llegaría como una ráfaga de teclas sueltas, con su
+/// `enter` final enviando el formulario a medias. Con él, llega entero como un
+/// solo `Event::Paste`.
+///
+/// El modo se apaga también si el programa revienta: `ratatui::init()` deja un
+/// hook de pánico que restaura la terminal, y aquí se encadena el nuestro
+/// delante para que corra antes de esa restauración.
+fn enable_bracketed_paste() {
+    if execute!(std::io::stdout(), EnableBracketedPaste).is_err() {
+        return;
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+        previous(info);
+    }));
 }
 
 fn event_loop(
@@ -197,6 +220,7 @@ fn event_loop(
 fn dispatch(app: &mut App, msg: Msg) {
     match msg {
         Msg::Input(TermEvent::Key(key)) if key.kind == KeyEventKind::Press => on_key(app, key),
+        Msg::Input(TermEvent::Paste(text)) => app.on_paste(text),
         Msg::Input(_) => {}
         other => app.handle(other),
     }

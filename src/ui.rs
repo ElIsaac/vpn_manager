@@ -947,12 +947,12 @@ fn draw_dropzone(frame: &mut Frame, area: Rect, label: &str, value: &str, focuse
     let lines = if value.is_empty() {
         vec![
             Line::from(Span::styled(
-                "suelta aquí tu archivo .ovpn",
+                "arrastra aquí tu .ovpn (tu terminal pega la ruta)",
                 Style::new().fg(if focused { Color::White } else { MUTED }).bold(),
             ))
             .centered(),
             Line::from(Span::styled(
-                "o pulsa F3 para buscarlo en el disco",
+                "o pégala con ctrl+shift+v · F3 para buscarla en el disco",
                 Style::new().fg(MUTED),
             ))
             .centered(),
@@ -962,7 +962,7 @@ fn draw_dropzone(frame: &mut Frame, area: Rect, label: &str, value: &str, focuse
             Line::from(Span::styled(value.to_string(), Style::new().fg(Color::White)))
                 .centered(),
             Line::from(Span::styled(
-                "F3 para elegir otro",
+                "arrastra otro archivo o pulsa F3 para elegirlo",
                 Style::new().fg(MUTED),
             ))
             .centered(),

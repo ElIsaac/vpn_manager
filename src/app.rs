@@ -68,6 +68,103 @@ pub fn validate_profile_name(others: usize, name: &str) -> Result<Option<String>
     }
 }
 
+/// Interpreta el texto que llega al soltar un archivo sobre la terminal.
+///
+/// En una TUI no hay drag & drop de verdad: lo que hace el emulador de terminal
+/// al soltar un archivo es *pegar la ruta como texto*, y cada uno la escribe a
+/// su manera — cruda, entre comillas, con los espacios escapados al estilo
+/// shell, o como URI `file://` percent-encoded, y casi siempre con un salto de
+/// línea al final. Esto lo deja en una ruta utilizable, o `None` si lo pegado
+/// no parece una ruta.
+pub fn normalize_dropped_path(text: &str) -> Option<PathBuf> {
+    // Soltar varios archivos pega varias líneas: nos quedamos con la primera.
+    let mut candidate = text.lines().map(str::trim).find(|l| !l.is_empty())?.to_string();
+
+    // Comillas: dentro de comillas simples el shell no interpreta escapes, así
+    // que ahí no hay backslashes que deshacer.
+    let mut unescape = true;
+    for quote in ['\'', '"'] {
+        if candidate.len() >= 2 && candidate.starts_with(quote) && candidate.ends_with(quote) {
+            candidate = candidate[1..candidate.len() - 1].to_string();
+            unescape = quote != '\'';
+            break;
+        }
+    }
+
+    if let Some(rest) = candidate.strip_prefix("file://") {
+        // `file:///ruta` y `file://host/ruta`: en ambos la ruta empieza en la
+        // primera `/`. El percent-decoding solo aplica aquí — en una ruta
+        // normal un `%` es un `%` y decodificarlo la rompería.
+        let path = rest.find('/').map(|i| &rest[i..])?;
+        candidate = percent_decode(path);
+    } else if unescape {
+        candidate = unescape_backslashes(&candidate);
+    }
+
+    if candidate.is_empty() {
+        return None;
+    }
+    if let Some(rest) = candidate.strip_prefix('~') {
+        if rest.is_empty() || rest.starts_with('/') {
+            let home = dirs::home_dir()?;
+            return Some(home.join(rest.trim_start_matches('/')));
+        }
+    }
+    // Un archivo soltado siempre trae ruta absoluta; lo demás es texto suelto.
+    if candidate.starts_with('/') || candidate.starts_with("./") || candidate.starts_with("../") {
+        Some(PathBuf::from(candidate))
+    } else {
+        None
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+            if let Some(byte) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Primera línea del texto pegado: un salto de línea dentro de un campo no
+/// aporta nada y, sin filtrarlo, el `\n` final de un drop enviaría el
+/// formulario.
+fn first_line(text: &str) -> String {
+    text.lines().next().unwrap_or_default().to_string()
+}
+
+fn insert_text(input: &mut Input, text: &str) {
+    for c in text.chars() {
+        input.handle(tui_input::InputRequest::InsertChar(c));
+    }
+}
+
+fn unescape_backslashes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Pantalla visible. `Dashboard` es la entrada: un solo panel "VPNS" con los
 /// tres tipos mezclados (perfiles OpenVPN3 + FortiVPN + la fila única de
 /// Tailscale) — todo lo demás vive en `Config`, o en `Tailscale` para las dos
@@ -982,6 +1079,108 @@ impl App {
             Some(FileTarget::General(_)) | None => ConfigScreen::General,
         };
         self.screen = Screen::Config(back);
+    }
+
+    // -------------------------------------------------------- pegar / soltar
+
+    /// Texto pegado en la terminal — que es también lo que llega al *soltar* un
+    /// archivo sobre la ventana, porque el emulador lo traduce a un paste.
+    pub fn on_paste(&mut self, text: String) {
+        let dropped = normalize_dropped_path(&text);
+
+        match self.screen {
+            // Soltar el .ovpn sobre el asistente abre directo el formulario de
+            // ese tipo con la ruta ya puesta: es el atajo que espera quien
+            // arrastra el archivo a la pantalla que se lo está pidiendo.
+            Screen::Setup(kind @ (Kind::OpenVpn | Kind::Forti)) => {
+                let Some(path) = dropped else { return };
+                self.enter_setup(kind);
+                self.setup_confirm();
+                self.paste_into_dropzone(path);
+            }
+            Screen::Config(ConfigScreen::ProfileForm) => self.paste_into_profile_form(text, dropped),
+            Screen::Config(ConfigScreen::General) => self.paste_into_general_form(text, dropped),
+            Screen::Config(ConfigScreen::FilePicker) => {
+                if let Some(path) = dropped.filter(|p| p.is_file()) {
+                    self.apply_picked_file(path);
+                }
+            }
+            Screen::Tailscale(TailscaleScreen::RoutesForm) => {
+                let line = first_line(&text);
+                insert_text(&mut self.routes_input, &line);
+            }
+            _ => {}
+        }
+    }
+
+    fn paste_into_profile_form(&mut self, text: String, dropped: Option<PathBuf>) {
+        let Some(form) = self.profile_form.as_ref() else { return };
+        let focus_is_dropzone = form.fields.get(form.focus).map(|f| f.pickable).unwrap_or(false);
+        let has_dropzone = form.fields.iter().any(|f| f.pickable);
+
+        // Con el dropzone enfocado, cualquier ruta va ahí. Con el foco en otro
+        // campo, un archivo que existe de verdad también: quien arrastra un
+        // .ovpn no quiere la ruta escrita dentro de "nombre".
+        let to_dropzone = match &dropped {
+            Some(path) => focus_is_dropzone || (has_dropzone && path.is_file()),
+            None => false,
+        };
+
+        if to_dropzone {
+            self.paste_into_dropzone(dropped.unwrap());
+            return;
+        }
+        let line = first_line(&text);
+        if let Some(form) = self.profile_form.as_mut() {
+            if let Some(field) = form.fields.get_mut(form.focus) {
+                insert_text(&mut field.input, &line);
+            }
+        }
+    }
+
+    /// Deja la ruta en la zona de importación y avisa si algo no cuadra, en vez
+    /// de aceptarla en silencio.
+    fn paste_into_dropzone(&mut self, path: PathBuf) {
+        let Some(form) = self.profile_form.as_mut() else { return };
+        let Some(idx) = form.fields.iter().position(|f| f.pickable) else { return };
+        let value = path.to_string_lossy().into_owned();
+        form.fields[idx].input = Input::new(value.clone());
+        form.focus = idx;
+
+        let is_ovpn = path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("ovpn"))
+            .unwrap_or(false);
+        form.error = if !path.is_file() {
+            Some(format!("no existe: {value}"))
+        } else if !is_ovpn {
+            Some(format!("ojo: {value} no termina en .ovpn (se usará igual)"))
+        } else {
+            None
+        };
+    }
+
+    fn paste_into_general_form(&mut self, text: String, dropped: Option<PathBuf>) {
+        let Some(form) = self.general_form.as_mut() else { return };
+        // 2 y 3 son las rutas de los scripts de IPv6; el resto, texto normal.
+        let is_path_field = matches!(form.focus, 2 | 3);
+        if let (true, Some(path)) = (is_path_field, dropped) {
+            let value = Input::new(path.to_string_lossy().into_owned());
+            match form.focus {
+                2 => form.ipv6_disable_script = value,
+                3 => form.ipv6_enable_script = value,
+                _ => {}
+            }
+            return;
+        }
+        let line = first_line(&text);
+        match form.focus {
+            0 => insert_text(&mut form.poll_interval_ms, &line),
+            1 => insert_text(&mut form.log_capacity, &line),
+            2 => insert_text(&mut form.ipv6_disable_script, &line),
+            3 => insert_text(&mut form.ipv6_enable_script, &line),
+            _ => {}
+        }
     }
 
     // ------------------------------------------------------- general (config)
@@ -1960,5 +2159,175 @@ mod tests {
         let app = test_app();
         // Solo la fila real de Tailscale cuenta.
         assert_eq!(app.summary(), (0, 1));
+    }
+
+    // ------------------------------------------------------------ soltar archivo
+
+    fn dropped(text: &str) -> Option<String> {
+        normalize_dropped_path(text).map(|p| p.to_string_lossy().into_owned())
+    }
+
+    /// Cada emulador de terminal pega la ruta a su manera cuando sueltas un
+    /// archivo sobre la ventana; todas estas formas son reales.
+    #[test]
+    fn normaliza_la_ruta_de_un_archivo_soltado() {
+        let plain = "/home/isaac/apps/vpns/thinkpad.ovpn";
+        assert_eq!(dropped(plain).as_deref(), Some(plain));
+        // Casi siempre viene con salto de línea al final (que además enviaría
+        // el formulario si se tratara como tecleo normal).
+        assert_eq!(dropped("/x/a.ovpn\n").as_deref(), Some("/x/a.ovpn"));
+        assert_eq!(dropped("/x/a.ovpn\r\n").as_deref(), Some("/x/a.ovpn"));
+        // Comillas cuando la ruta trae espacios.
+        assert_eq!(
+            dropped("'/home/isaac/mi carpeta/vpn.ovpn'").as_deref(),
+            Some("/home/isaac/mi carpeta/vpn.ovpn")
+        );
+        assert_eq!(
+            dropped("\"/home/isaac/mi carpeta/vpn.ovpn\"").as_deref(),
+            Some("/home/isaac/mi carpeta/vpn.ovpn")
+        );
+        // URI file:// (GNOME/Nautilus y varios más).
+        assert_eq!(
+            dropped("file:///home/isaac/apps/vpns/thinkpad.ovpn").as_deref(),
+            Some("/home/isaac/apps/vpns/thinkpad.ovpn")
+        );
+        assert_eq!(
+            dropped("file://localhost/x/a.ovpn").as_deref(),
+            Some("/x/a.ovpn")
+        );
+        // URI con percent-encoding.
+        assert_eq!(
+            dropped("file:///home/isaac/mi%20carpeta/vpn.ovpn").as_deref(),
+            Some("/home/isaac/mi carpeta/vpn.ovpn")
+        );
+        // Espacios escapados al estilo shell.
+        assert_eq!(
+            dropped("/home/isaac/mi\\ carpeta/vpn.ovpn").as_deref(),
+            Some("/home/isaac/mi carpeta/vpn.ovpn")
+        );
+        // Varios archivos soltados a la vez: se toma el primero.
+        assert_eq!(
+            dropped("\n/x/uno.ovpn\n/x/dos.ovpn\n").as_deref(),
+            Some("/x/uno.ovpn")
+        );
+        // `~` se expande, porque también se pega a mano.
+        let home = dirs::home_dir().unwrap().join("a.ovpn");
+        assert_eq!(dropped("~/a.ovpn"), Some(home.to_string_lossy().into_owned()));
+    }
+
+    /// El `%` de un nombre de archivo normal no se toca: solo se decodifica
+    /// cuando la fuente era un URI, que sí viene percent-encoded.
+    #[test]
+    fn solo_decodifica_percent_en_uris() {
+        assert_eq!(dropped("/x/100%25.ovpn").as_deref(), Some("/x/100%25.ovpn"));
+        assert_eq!(dropped("file:///x/100%25.ovpn").as_deref(), Some("/x/100%.ovpn"));
+    }
+
+    #[test]
+    fn texto_que_no_es_ruta_no_pasa() {
+        assert_eq!(dropped(""), None);
+        assert_eq!(dropped("   \n  "), None);
+        assert_eq!(dropped("hola mundo"), None);
+        assert_eq!(dropped("https://ejemplo.com/a.ovpn"), None);
+    }
+
+    /// Soltar el archivo con el dropzone enfocado llena la ruta; el salto de
+    /// línea final NO debe enviar el formulario.
+    #[test]
+    fn soltar_un_ovpn_llena_el_dropzone() {
+        let mut app = test_app();
+        let file = std::env::temp_dir().join("vpn-tui-test-drop.ovpn");
+        std::fs::write(&file, "client\n").unwrap();
+
+        app.open_profile_form_new(Kind::OpenVpn);
+        app.profile_form.as_mut().unwrap().focus = 1; // el dropzone
+        app.on_paste(format!("{}\n", file.display()));
+
+        let form = app.profile_form.as_ref().unwrap();
+        assert_eq!(form.fields[1].input.value(), file.to_string_lossy());
+        assert_eq!(form.error, None);
+        // Sigue en el formulario: no se guardó ni se salió por el `\n`.
+        assert_eq!(app.screen, Screen::Config(ConfigScreen::ProfileForm));
+        std::fs::remove_file(&file).ok();
+    }
+
+    /// Soltarlo con otro campo enfocado igual llena el dropzone: es lo que
+    /// quiere quien arrastra un archivo, no escribir la ruta en "nombre".
+    #[test]
+    fn soltar_un_archivo_existente_va_al_dropzone_aunque_el_foco_este_en_otro_campo() {
+        let mut app = test_app();
+        let file = std::env::temp_dir().join("vpn-tui-test-drop2.ovpn");
+        std::fs::write(&file, "client\n").unwrap();
+
+        app.open_profile_form_new(Kind::OpenVpn);
+        app.profile_form.as_mut().unwrap().focus = 0; // campo "nombre"
+        app.on_paste(file.to_string_lossy().into_owned());
+
+        let form = app.profile_form.as_ref().unwrap();
+        assert_eq!(form.fields[1].input.value(), file.to_string_lossy());
+        assert!(form.fields[0].input.value().is_empty(), "el nombre queda limpio");
+        assert_eq!(form.focus, 1, "el foco se mueve a la zona de importación");
+        std::fs::remove_file(&file).ok();
+    }
+
+    /// Una ruta que no existe se muestra igual (para poder corregirla) pero con
+    /// un error explícito, nunca en silencio.
+    #[test]
+    fn una_ruta_inexistente_avisa_en_el_dropzone() {
+        let mut app = test_app();
+        app.open_profile_form_new(Kind::OpenVpn);
+        app.profile_form.as_mut().unwrap().focus = 1;
+        app.on_paste("/no/existe/x.ovpn".to_string());
+
+        let form = app.profile_form.as_ref().unwrap();
+        assert_eq!(form.fields[1].input.value(), "/no/existe/x.ovpn");
+        assert!(form.error.as_deref().unwrap_or_default().contains("no existe"));
+    }
+
+    /// Un archivo real con otra extensión se acepta, solo avisa.
+    #[test]
+    fn otra_extension_avisa_pero_no_bloquea() {
+        let mut app = test_app();
+        let file = std::env::temp_dir().join("vpn-tui-test-drop.conf");
+        std::fs::write(&file, "client\n").unwrap();
+
+        app.open_profile_form_new(Kind::OpenVpn);
+        app.profile_form.as_mut().unwrap().focus = 1;
+        app.on_paste(file.to_string_lossy().into_owned());
+
+        let form = app.profile_form.as_ref().unwrap();
+        assert_eq!(form.fields[1].input.value(), file.to_string_lossy());
+        assert!(form.error.as_deref().unwrap_or_default().contains(".ovpn"));
+        std::fs::remove_file(&file).ok();
+    }
+
+    /// En un campo de texto normal, pegar inserta el texto (sin el salto final).
+    #[test]
+    fn pegar_texto_normal_llena_el_campo_enfocado() {
+        let mut app = test_app();
+        app.open_profile_form_new(Kind::Forti);
+        app.profile_form.as_mut().unwrap().focus = 1; // host:puerto
+        app.on_paste("vpn.ejemplo.com:10443\n".to_string());
+
+        let form = app.profile_form.as_ref().unwrap();
+        assert_eq!(form.fields[1].input.value(), "vpn.ejemplo.com:10443");
+    }
+
+    /// Soltar el .ovpn sobre el asistente abre el formulario ya con la ruta.
+    #[test]
+    fn soltar_un_ovpn_en_el_asistente_abre_el_formulario_con_la_ruta() {
+        let mut app = test_app();
+        let file = std::env::temp_dir().join("vpn-tui-test-drop3.ovpn");
+        std::fs::write(&file, "client\n").unwrap();
+
+        app.enter_setup(Kind::OpenVpn);
+        app.on_paste(file.to_string_lossy().into_owned());
+
+        assert_eq!(app.screen, Screen::Config(ConfigScreen::ProfileForm));
+        let form = app.profile_form.as_ref().unwrap();
+        assert_eq!(form.kind, Kind::OpenVpn);
+        assert_eq!(form.origin, FormOrigin::Setup);
+        assert_eq!(form.fields[1].input.value(), file.to_string_lossy());
+        std::fs::remove_file(&file).ok();
     }
 }
