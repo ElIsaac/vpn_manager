@@ -134,13 +134,17 @@ install_system_deps() {
     warn "vuelve a ejecutar con sudo, o instálalas tú mismo"
     return
   fi
+  # Cada dependencia es independiente: si una falla (repo caído, systemd
+  # ausente en un contenedor, red intermitente, etc.) se avisa y se sigue con
+  # las demás y con compilar/instalar el binario — no tiene sentido tronar
+  # todo el instalador por un tipo de VPN que el usuario puede no necesitar.
   case "$PKG_MANAGER" in
-    dnf) install_openvpn3_fedora ;;
-    apt) install_openvpn3_debian ;;
+    dnf) install_openvpn3_fedora || warn "openvpn3 no se pudo instalar; sigo sin él" ;;
+    apt) install_openvpn3_debian || warn "openvpn3 no se pudo instalar; sigo sin él" ;;
     *) warn "omito openvpn3: distro no reconocida" ;;
   esac
-  install_openfortivpn
-  install_tailscale
+  install_openfortivpn || warn "openfortivpn no se pudo instalar; sigo sin él"
+  install_tailscale || warn "tailscale no se pudo instalar; sigo sin él"
 }
 
 # --- compilación -----------------------------------------------------------
