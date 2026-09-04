@@ -54,6 +54,14 @@ pub enum Msg {
         err: String,
     },
 
+    /// Terminó un cierre de sesión openvpn3 lanzado desde la pantalla de
+    /// sesiones. `path` = `None` cuando era "matar todas".
+    SessionKillDone {
+        path: Option<String>,
+        level: Level,
+        text: String,
+    },
+
     /// Estado del sistema recogido periódicamente.
     Poll(Box<Snapshot>),
 }

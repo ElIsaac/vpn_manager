@@ -173,7 +173,7 @@ impl SecretFile {
         let path = dir.join(format!(
             "forti-{}-{}.conf",
             std::process::id(),
-            profile.name
+            profile.name.as_deref().unwrap_or("default")
         ));
         let mut body = String::new();
         body.push_str("# generado por vpn-tui; se borra al desconectar\n");

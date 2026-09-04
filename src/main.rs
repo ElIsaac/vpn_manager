@@ -13,7 +13,7 @@ use ratatui::crossterm::event::{
     Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 
-use app::{App, ConfigScreen, FileTarget, Focus, Kind, Screen, TailscaleScreen};
+use app::{App, ConfigScreen, FileTarget, Focus, FormOrigin, Kind, Screen, TailscaleScreen};
 use db::Db;
 use event::{Events, Level, Msg};
 
@@ -94,20 +94,22 @@ fn print_status(db: &Db) -> Result<()> {
     let forti = vpn::fortivpn::running_pids();
 
     for profile in db.openvpn_profiles().unwrap_or_default() {
+        let name = app::display_name(Kind::OpenVpn, profile.name.as_deref());
         let session = sessions
             .iter()
             .find(|s| vpn::openvpn3::matches_config(s, &profile.config));
         match session {
             Some(s) if s.is_connected() => {
-                println!("openvpn  {:<16} conectado   {}", profile.name, s.path)
+                println!("openvpn  {name:<24} conectado   {}", s.path)
             }
-            _ => println!("openvpn  {:<16} desconectado", profile.name),
+            _ => println!("openvpn  {name:<24} desconectado"),
         }
     }
     for (i, profile) in db.forti_profiles().unwrap_or_default().iter().enumerate() {
+        let name = app::display_name(Kind::Forti, profile.name.as_deref());
         match forti.get(i) {
-            Some(pid) => println!("forti    {:<16} conectado   pid {pid}", profile.name),
-            None => println!("forti    {:<16} desconectado", profile.name),
+            Some(pid) => println!("forti    {name:<24} conectado   pid {pid}"),
+            None => println!("forti    {name:<24} desconectado"),
         }
     }
     if vpn::tailscale::is_available() {
@@ -219,6 +221,23 @@ fn on_key(app: &mut App, key: KeyEvent) {
         Screen::Dashboard => on_key_dashboard(app, key),
         Screen::Tailscale(screen) => on_key_tailscale(app, key, screen),
         Screen::Config(screen) => on_key_config(app, key, screen),
+        Screen::Setup(_) => on_key_setup(app, key),
+    }
+}
+
+/// Asistente de primera configuración: carrusel con `←`/`→`, `enter` entra a
+/// configurar ese tipo, `esc` sale al dashboard.
+fn on_key_setup(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.back_to_dashboard(),
+        KeyCode::Right | KeyCode::Char('l') => app.setup_slide(true),
+        KeyCode::Left | KeyCode::Char('h') => app.setup_slide(false),
+        KeyCode::Char('1') => app.enter_setup(Kind::OpenVpn),
+        KeyCode::Char('2') => app.enter_setup(Kind::Forti),
+        KeyCode::Char('3') => app.enter_setup(Kind::Tailscale),
+        KeyCode::Enter | KeyCode::Char(' ') => app.setup_confirm(),
+        KeyCode::Char('?') | KeyCode::F(1) => app.show_help = true,
+        _ => {}
     }
 }
 
@@ -226,24 +245,30 @@ fn on_key_dashboard(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
         KeyCode::Char('?') | KeyCode::F(1) => app.show_help = true,
-        KeyCode::F(2) => app.enter_config_menu(),
-        KeyCode::Tab | KeyCode::BackTab => app.toggle_focus(),
+
+        // Los paneles se recorren con ←/→ (incluido el botón ⚙); `tab` ya no
+        // mueve el foco aquí — sigue siendo "siguiente campo" en los
+        // formularios, que es otro contexto.
+        KeyCode::Right => app.focus_next(),
+        KeyCode::Left => app.focus_prev(),
 
         KeyCode::Char('1') => app.select_kind(Kind::OpenVpn),
         KeyCode::Char('2') => app.select_kind(Kind::Forti),
         KeyCode::Char('3') => app.select_kind(Kind::Tailscale),
 
         KeyCode::Up | KeyCode::Char('k') => match app.focus {
-            Focus::Profiles => app.select_prev(),
+            Focus::Profiles | Focus::ConfigButton => app.select_prev(),
             Focus::Logs => app.scroll_logs(-1),
         },
         KeyCode::Down | KeyCode::Char('j') => match app.focus {
-            Focus::Profiles => app.select_next(),
+            Focus::Profiles | Focus::ConfigButton => app.select_next(),
             Focus::Logs => app.scroll_logs(1),
         },
 
         KeyCode::Enter | KeyCode::Char(' ') => {
-            if let Some(idx) = app.selected_absolute() {
+            if app.focus == Focus::ConfigButton {
+                app.enter_config_menu();
+            } else if let Some(idx) = app.selected_absolute() {
                 app.toggle(idx);
             }
         }
@@ -344,6 +369,17 @@ fn on_key_config(app: &mut App, key: KeyEvent, screen: ConfigScreen) {
             _ => {}
         },
         ConfigScreen::OpenVpnSessions => on_key_sessions(app, key),
+        ConfigScreen::ConfirmDelete { kind, idx } => match key.code {
+            KeyCode::Char('s') | KeyCode::Char('y') | KeyCode::Enter => {
+                app.delete_profile(kind, idx);
+                app.profile_list_selected = 0;
+                app.screen = Screen::Config(ConfigScreen::ProfileList(kind));
+            }
+            KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
+                app.screen = Screen::Config(ConfigScreen::ProfileList(kind));
+            }
+            _ => {}
+        },
     }
 }
 
@@ -395,18 +431,35 @@ fn on_key_profile_list(app: &mut App, key: KeyEvent, kind: Kind) {
         KeyCode::Char('n') => app.open_profile_form_new(kind),
         KeyCode::Char('e') if len > 0 => app.open_profile_form_edit(kind, app.profile_list_selected),
         KeyCode::Char('x') if len > 0 => {
-            app.delete_profile(kind, app.profile_list_selected);
-            app.profile_list_selected = 0;
+            // Borrar tira configuración (y credenciales, en Forti): se
+            // confirma antes, nunca directo.
+            app.screen = Screen::Config(ConfigScreen::ConfirmDelete {
+                kind,
+                idx: app.profile_list_selected,
+            });
         }
         _ => {}
+    }
+}
+
+/// A dónde vuelve el formulario de perfil al guardar o cancelar: a la lista de
+/// config si vino de ahí, o al dashboard si lo abrió el asistente.
+fn profile_form_exit(kind: Kind, origin: FormOrigin) -> Screen {
+    match origin {
+        FormOrigin::ConfigList => Screen::Config(ConfigScreen::ProfileList(kind)),
+        FormOrigin::Setup => Screen::Dashboard,
     }
 }
 
 fn on_key_profile_form(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
-            let kind = app.profile_form.take().map(|f| f.kind).unwrap_or(Kind::OpenVpn);
-            app.screen = Screen::Config(ConfigScreen::ProfileList(kind));
+            let (kind, origin) = app
+                .profile_form
+                .take()
+                .map(|f| (f.kind, f.origin))
+                .unwrap_or((Kind::OpenVpn, FormOrigin::ConfigList));
+            app.screen = profile_form_exit(kind, origin);
         }
         KeyCode::Tab => {
             if let Some(form) = app.profile_form.as_mut() {
@@ -428,10 +481,10 @@ fn on_key_profile_form(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Enter => {
-            let kind_before = app.profile_form.as_ref().map(|f| f.kind);
+            let before = app.profile_form.as_ref().map(|f| (f.kind, f.origin));
             if app.save_profile_form() {
-                if let Some(kind) = kind_before {
-                    app.screen = Screen::Config(ConfigScreen::ProfileList(kind));
+                if let Some((kind, origin)) = before {
+                    app.screen = profile_form_exit(kind, origin);
                 }
             }
         }
@@ -533,6 +586,11 @@ fn on_key_general(app: &mut App, key: KeyEvent) {
 
 fn on_key_sessions(app: &mut App, key: KeyEvent) {
     let n = app.all_openvpn_sessions.len();
+    // Con un cierre en curso solo se permite mirar: nada de disparar otro
+    // `disconnect` sobre la misma sesión ni salir a media faena.
+    if app.sessions_busy() && !matches!(key.code, KeyCode::Up | KeyCode::Down) {
+        return;
+    }
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('n') => app.enter_config_menu(),
         KeyCode::Up | KeyCode::Char('k')

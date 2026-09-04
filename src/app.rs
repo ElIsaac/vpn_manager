@@ -1,6 +1,6 @@
 //! Estado de la aplicación y transiciones.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
@@ -32,6 +32,40 @@ impl Kind {
             Kind::Tailscale => "Tailscale",
         }
     }
+
+    /// Los tres tipos, en el orden en que se muestran (panel VPNS y slider).
+    pub const ALL: [Kind; 3] = [Kind::OpenVpn, Kind::Forti, Kind::Tailscale];
+}
+
+/// Cómo se nombra una fila del panel VPNS: el tipo manda, y el nombre del
+/// perfil solo aparece entre paréntesis cuando el usuario puso uno.
+pub fn display_name(kind: Kind, name: Option<&str>) -> String {
+    match name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(name) => format!("{} ({name})", kind.label()),
+        None => kind.label().to_string(),
+    }
+}
+
+/// Texto de la fila cuando ese tipo de VPN no tiene ningún perfil todavía.
+pub fn unconfigured_name(kind: Kind) -> String {
+    format!("{} No Configurada", kind.label())
+}
+
+/// Regla de nombres: el primer perfil de un tipo puede ir sin nombre (basta el
+/// tipo para identificarlo), pero en cuanto hay dos del mismo tipo el nombre
+/// es obligatorio o serían indistinguibles en la lista.
+///
+/// `others` = cuántos perfiles de ese mismo tipo quedarían aparte de éste.
+pub fn validate_profile_name(others: usize, name: &str) -> Result<Option<String>, String> {
+    let name = name.trim();
+    if !name.is_empty() {
+        return Ok(Some(name.to_string()));
+    }
+    if others == 0 {
+        Ok(None)
+    } else {
+        Err("ya hay otro perfil de este tipo: ponle un nombre para distinguirlos".into())
+    }
 }
 
 /// Pantalla visible. `Dashboard` es la entrada: un solo panel "VPNS" con los
@@ -43,6 +77,10 @@ pub enum Screen {
     Dashboard,
     Tailscale(TailscaleScreen),
     Config(ConfigScreen),
+    /// Asistente de primera configuración: un carrusel (`←`/`→`) con un pane
+    /// por tipo de VPN. Solo aparece cuando falta configuración — desde una
+    /// fila "No Configurada" o al arrancar con la base de datos vacía.
+    Setup(Kind),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +98,17 @@ pub enum ConfigScreen {
     General,
     Ipv6Status,
     OpenVpnSessions,
+    /// Confirmación antes de borrar el perfil `idx` de la lista de `kind`.
+    ConfirmDelete { kind: Kind, idx: usize },
+}
+
+/// De dónde se abrió el formulario de perfil, para saber a dónde volver al
+/// guardar o cancelar. El mismo formulario se usa desde el menú de config y
+/// desde el asistente de primera configuración.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormOrigin {
+    ConfigList,
+    Setup,
 }
 
 /// A qué campo vuelve la ruta elegida en el `FilePicker`.
@@ -77,7 +126,8 @@ pub struct FormField {
     pub label: &'static str,
     pub input: Input,
     pub mask: bool,
-    /// Si `true`, este campo tiene una acción de "buscar archivo" (F3).
+    /// Si `true`, este campo tiene una acción de "buscar archivo" (F3) y se
+    /// dibuja como zona de importación (dropzone) en vez de como línea suelta.
     pub pickable: bool,
 }
 
@@ -109,14 +159,18 @@ pub struct ProfileForm {
     pub fields: Vec<FormField>,
     pub focus: usize,
     pub error: Option<String>,
+    pub origin: FormOrigin,
 }
 
 impl ProfileForm {
     pub fn new_openvpn(existing: Option<&OpenVpnProfile>) -> Self {
         let fields = vec![
-            FormField::new("nombre", existing.map(|p| p.name.clone()).unwrap_or_default()),
             FormField::new(
-                "ruta .ovpn (F3 buscar)",
+                "nombre (opcional)",
+                existing.and_then(|p| p.name.clone()).unwrap_or_default(),
+            ),
+            FormField::new(
+                "archivo .ovpn",
                 existing
                     .map(|p| p.config.to_string_lossy().into_owned())
                     .unwrap_or_default(),
@@ -129,12 +183,16 @@ impl ProfileForm {
             fields,
             focus: 0,
             error: None,
+            origin: FormOrigin::ConfigList,
         }
     }
 
     pub fn new_forti(existing: Option<&FortiProfile>) -> Self {
         let fields = vec![
-            FormField::new("nombre", existing.map(|p| p.name.clone()).unwrap_or_default()),
+            FormField::new(
+                "nombre (opcional)",
+                existing.and_then(|p| p.name.clone()).unwrap_or_default(),
+            ),
             FormField::new("host:puerto", existing.map(|p| p.host.clone()).unwrap_or_default()),
             FormField::new("usuario", existing.map(|p| p.username.clone()).unwrap_or_default()),
             FormField::new(
@@ -161,7 +219,13 @@ impl ProfileForm {
             fields,
             focus: 0,
             error: None,
+            origin: FormOrigin::ConfigList,
         }
+    }
+
+    fn opened_from_setup(mut self) -> Self {
+        self.origin = FormOrigin::Setup;
+        self
     }
 
     pub fn next_field(&mut self) {
@@ -245,6 +309,9 @@ pub struct Profile {
     /// La conexión ya existía cuando arrancó la TUI (o la creó otro proceso).
     pub adopted: bool,
     pub last_error: Option<String>,
+    /// Fila "…No Configurada": ese tipo de VPN no tiene ningún perfil todavía,
+    /// así que no se puede conectar — `enter` abre el asistente en su lugar.
+    pub placeholder: bool,
     prev_sample: Option<(Stats, Instant)>,
 }
 
@@ -266,8 +333,15 @@ impl Profile {
             rate_out: VecDeque::new(),
             adopted: false,
             last_error: None,
+            placeholder: false,
             prev_sample: None,
         }
+    }
+
+    fn placeholder(kind: Kind) -> Self {
+        let mut p = Self::new(unconfigured_name(kind), kind, 0, String::new());
+        p.placeholder = true;
+        p
     }
 
     /// Tiempo transcurrido en el estado actual.
@@ -324,10 +398,27 @@ fn push_capped(q: &mut VecDeque<u64>, value: u64) {
     q.push_back(value);
 }
 
+/// Paneles del dashboard por los que se mueve el foco con `←`/`→`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Profiles,
     Logs,
+    /// El recuadro `⚙ configuración`: `enter` abre el menú de config.
+    ConfigButton,
+}
+
+impl Focus {
+    const ORDER: [Focus; 3] = [Focus::Profiles, Focus::Logs, Focus::ConfigButton];
+
+    pub fn next(self) -> Self {
+        let i = Self::ORDER.iter().position(|f| *f == self).unwrap_or(0);
+        Self::ORDER[(i + 1) % Self::ORDER.len()]
+    }
+
+    pub fn prev(self) -> Self {
+        let i = Self::ORDER.iter().position(|f| *f == self).unwrap_or(0);
+        Self::ORDER[(i + Self::ORDER.len() - 1) % Self::ORDER.len()]
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -371,6 +462,10 @@ pub struct App {
     pub file_target: Option<FileTarget>,
     pub all_openvpn_sessions: Vec<openvpn3::Session>,
     pub sessions_selected: usize,
+    /// Sesiones openvpn3 con un cierre en curso (spinner + teclas bloqueadas).
+    pub killing_sessions: HashSet<String>,
+    /// "Matar todas" en curso.
+    pub killing_all: bool,
 
     // --- tailscale --------------------------------------------------------
     pub tailscale_available: bool,
@@ -388,12 +483,20 @@ impl App {
         let forti_profiles = db.forti_profiles().unwrap_or_default();
         let profiles = build_profiles(&openvpn_profiles, &forti_profiles);
 
+        // Sin ningún perfil no hay nada que mostrar en el panel: se entra
+        // directo al asistente, en el primer pane (OpenVPN3).
+        let screen = if openvpn_profiles.is_empty() && forti_profiles.is_empty() {
+            Screen::Setup(Kind::OpenVpn)
+        } else {
+            Screen::Dashboard
+        };
+
         let mut app = Self {
             db,
             general,
             openvpn_profiles,
             forti_profiles,
-            screen: Screen::Dashboard,
+            screen,
             profiles,
             selected: 0,
             logs: VecDeque::new(),
@@ -416,6 +519,8 @@ impl App {
             file_target: None,
             all_openvpn_sessions: Vec::new(),
             sessions_selected: 0,
+            killing_sessions: HashSet::new(),
+            killing_all: false,
             tailscale_available: tailscale::is_available(),
             tailscale_status: None,
             exit_node_selected: 0,
@@ -499,11 +604,14 @@ impl App {
         self.selected_absolute().and_then(|i| self.profiles.get(i))
     }
 
-    pub fn toggle_focus(&mut self) {
-        self.focus = match self.focus {
-            Focus::Profiles => Focus::Logs,
-            Focus::Logs => Focus::Profiles,
-        };
+    /// `→`: siguiente panel del dashboard.
+    pub fn focus_next(&mut self) {
+        self.focus = self.focus.next();
+    }
+
+    /// `←`: panel anterior.
+    pub fn focus_prev(&mut self) {
+        self.focus = self.focus.prev();
     }
 
     pub fn scroll_logs(&mut self, delta: i32) {
@@ -527,6 +635,43 @@ impl App {
     pub fn enter_config_menu(&mut self) {
         self.screen = Screen::Config(ConfigScreen::Menu);
         self.config_menu_selected = 0;
+    }
+
+    /// Abre el asistente de primera configuración en el pane de `kind`.
+    pub fn enter_setup(&mut self, kind: Kind) {
+        self.screen = Screen::Setup(kind);
+    }
+
+    /// `←`/`→` dentro del asistente: mueve al pane anterior/siguiente.
+    pub fn setup_slide(&mut self, forward: bool) {
+        let Screen::Setup(kind) = self.screen else {
+            return;
+        };
+        let i = Kind::ALL.iter().position(|k| *k == kind).unwrap_or(0);
+        let n = Kind::ALL.len();
+        let next = (if forward { i + 1 } else { i + n - 1 }) % n;
+        self.screen = Screen::Setup(Kind::ALL[next]);
+    }
+
+    /// `enter` dentro del asistente: entra a configurar el tipo del pane
+    /// actual. Es un atajo al MISMO formulario del menú de config; Tailscale
+    /// no tiene perfiles, así que ahí lo que procede es levantarlo.
+    pub fn setup_confirm(&mut self) {
+        let Screen::Setup(kind) = self.screen else {
+            return;
+        };
+        match kind {
+            Kind::OpenVpn | Kind::Forti => {
+                self.open_profile_form_new(kind);
+                if let Some(form) = self.profile_form.take() {
+                    self.profile_form = Some(form.opened_from_setup());
+                }
+            }
+            Kind::Tailscale => {
+                self.tailscale_toggle();
+                self.back_to_dashboard();
+            }
+        }
     }
 
     pub fn back_to_dashboard(&mut self) {
@@ -613,6 +758,30 @@ impl App {
         }
     }
 
+    /// Texto de la confirmación de borrado: dice exactamente qué se pierde.
+    pub fn delete_warning(&self, kind: Kind, list_idx: usize) -> Option<String> {
+        match kind {
+            Kind::OpenVpn => self.openvpn_profiles.get(list_idx).map(|p| {
+                format!(
+                    "Se eliminará la configuración guardada de {} y su ruta al archivo {}.\n\
+                     El archivo .ovpn en disco NO se borra.",
+                    display_name(kind, p.name.as_deref()),
+                    p.config.display()
+                )
+            }),
+            Kind::Forti => self.forti_profiles.get(list_idx).map(|p| {
+                format!(
+                    "Se eliminará la configuración guardada de {} ({}@{}), incluidas sus \
+                     credenciales almacenadas.",
+                    display_name(kind, p.name.as_deref()),
+                    p.username,
+                    p.host
+                )
+            }),
+            Kind::Tailscale => None,
+        }
+    }
+
     pub fn delete_profile(&mut self, kind: Kind, list_idx: usize) {
         let result = match kind {
             Kind::OpenVpn => self
@@ -642,12 +811,34 @@ impl App {
         };
         let value = |i: usize| form.fields[i].input.value().trim().to_string();
 
+        // Cuántos perfiles de este tipo quedarían aparte del que se guarda:
+        // con al menos uno más, el nombre deja de ser opcional.
+        let others = match form.kind {
+            Kind::OpenVpn => self
+                .openvpn_profiles
+                .iter()
+                .filter(|p| Some(p.id) != form.editing_id)
+                .count(),
+            Kind::Forti => self
+                .forti_profiles
+                .iter()
+                .filter(|p| Some(p.id) != form.editing_id)
+                .count(),
+            Kind::Tailscale => 0,
+        };
+
         let result = match form.kind {
             Kind::OpenVpn => {
-                let name = value(0);
+                let name = match validate_profile_name(others, &value(0)) {
+                    Ok(name) => name,
+                    Err(err) => {
+                        form.error = Some(err);
+                        return false;
+                    }
+                };
                 let path = value(1);
-                if name.is_empty() || path.is_empty() {
-                    form.error = Some("nombre y ruta son obligatorios".into());
+                if path.is_empty() {
+                    form.error = Some("falta el archivo .ovpn".into());
                     return false;
                 }
                 let config = PathBuf::from(&path);
@@ -656,12 +847,21 @@ impl App {
                     return false;
                 }
                 match form.editing_id {
-                    Some(id) => self.db.update_openvpn_profile(id, &name, &config),
-                    None => self.db.insert_openvpn_profile(&name, &config).map(|_| ()),
+                    Some(id) => self.db.update_openvpn_profile(id, name.as_deref(), &config),
+                    None => self
+                        .db
+                        .insert_openvpn_profile(name.as_deref(), &config)
+                        .map(|_| ()),
                 }
             }
             Kind::Forti => {
-                let name = value(0);
+                let name = match validate_profile_name(others, &value(0)) {
+                    Ok(name) => name,
+                    Err(err) => {
+                        form.error = Some(err);
+                        return false;
+                    }
+                };
                 let host = value(1);
                 let username = value(2);
                 let password = value(3);
@@ -673,8 +873,8 @@ impl App {
                     .filter(|s| !s.is_empty())
                     .map(str::to_string)
                     .collect();
-                if name.is_empty() || host.is_empty() || username.is_empty() {
-                    form.error = Some("nombre, host y usuario son obligatorios".into());
+                if host.is_empty() || username.is_empty() {
+                    form.error = Some("host y usuario son obligatorios".into());
                     return false;
                 }
                 if password.is_empty() && password_env.is_empty() {
@@ -687,7 +887,7 @@ impl App {
                 match form.editing_id {
                     Some(id) => self.db.update_forti_profile(
                         id,
-                        &name,
+                        name.as_deref(),
                         &host,
                         &username,
                         password,
@@ -698,7 +898,7 @@ impl App {
                     None => self
                         .db
                         .insert_forti_profile(
-                            &name,
+                            name.as_deref(),
                             &host,
                             &username,
                             password,
@@ -827,11 +1027,17 @@ impl App {
 
     // ----------------------------------------------------------------- acciones
 
-    /// Conecta o desconecta el perfil seleccionado según su estado.
+    /// Conecta o desconecta el perfil seleccionado según su estado. Sobre una
+    /// fila "No Configurada" no hay nada que conectar: abre el asistente.
     pub fn toggle(&mut self, idx: usize) {
         let Some(profile) = self.profiles.get(idx) else {
             return;
         };
+        if profile.placeholder {
+            let kind = profile.kind;
+            self.enter_setup(kind);
+            return;
+        }
         match profile.state {
             State::Connected => self.disconnect(idx),
             State::Disconnected | State::Failed(_) => self.connect(idx),
@@ -846,6 +1052,11 @@ impl App {
         let Some(profile) = self.profiles.get(idx) else {
             return;
         };
+        if profile.placeholder {
+            let kind = profile.kind;
+            self.enter_setup(kind);
+            return;
+        }
         if profile.state.is_busy() {
             return;
         }
@@ -916,7 +1127,7 @@ impl App {
         let Some(profile) = self.profiles.get(idx) else {
             return;
         };
-        if profile.state.is_busy() {
+        if profile.placeholder || profile.state.is_busy() {
             return;
         }
         if !profile.state.is_up() {
@@ -1003,6 +1214,7 @@ impl App {
     /// Conecta todos los perfiles (incluida la fila de Tailscale).
     pub fn connect_all(&mut self) {
         let targets: Vec<usize> = (0..self.profiles.len())
+            .filter(|i| !self.profiles[*i].placeholder)
             .filter(|i| !self.profiles[*i].state.is_up() && !self.profiles[*i].state.is_busy())
             .collect();
         if targets.is_empty() {
@@ -1112,35 +1324,57 @@ impl App {
 
     // ------------------------------------------------------- sesiones openvpn3
 
+    /// ¿Hay algún cierre de sesión en curso? Mientras lo haya, la pantalla de
+    /// sesiones ignora las teclas de acción para no disparar dos veces.
+    pub fn sessions_busy(&self) -> bool {
+        self.killing_all || !self.killing_sessions.is_empty()
+    }
+
     pub fn kill_selected_session(&mut self) {
+        if self.sessions_busy() {
+            return;
+        }
         let Some(session) = self.all_openvpn_sessions.get(self.sessions_selected).cloned() else {
             return;
         };
         self.toast(Level::Info, format!("cerrando sesión {}…", short(&session.path)));
+        self.killing_sessions.insert(session.path.clone());
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let msg = match openvpn3::disconnect(&session.path) {
-                Ok(()) => Msg::Log(None, Level::Ok, "sesión cerrada".into()),
-                Err(err) => Msg::Log(None, Level::Error, format!("no pude cerrar la sesión: {err}")),
+            let (level, text) = match openvpn3::disconnect(&session.path) {
+                Ok(()) => (Level::Ok, "sesión cerrada".to_string()),
+                Err(err) => (Level::Error, format!("no pude cerrar la sesión: {err}")),
             };
-            let _ = tx.send(msg);
+            let _ = tx.send(Msg::SessionKillDone {
+                path: Some(session.path),
+                level,
+                text,
+            });
         });
     }
 
     pub fn kill_all_sessions(&mut self) {
+        if self.sessions_busy() {
+            return;
+        }
         if self.all_openvpn_sessions.is_empty() {
             self.toast(Level::Info, "no hay sesiones openvpn3 activas");
             return;
         }
         let sessions = self.all_openvpn_sessions.clone();
         self.toast(Level::Info, format!("cerrando {} sesión(es)…", sessions.len()));
+        self.killing_all = true;
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let msg = match openvpn3::disconnect_all(&sessions) {
-                Ok(()) => Msg::Log(None, Level::Ok, "todas las sesiones cerradas".into()),
-                Err(err) => Msg::Log(None, Level::Error, format!("alguna sesión no cerró: {err}")),
+            let (level, text) = match openvpn3::disconnect_all(&sessions) {
+                Ok(()) => (Level::Ok, "todas las sesiones cerradas".to_string()),
+                Err(err) => (Level::Error, format!("alguna sesión no cerró: {err}")),
             };
-            let _ = tx.send(msg);
+            let _ = tx.send(Msg::SessionKillDone {
+                path: None,
+                level,
+                text,
+            });
         });
     }
 
@@ -1295,6 +1529,16 @@ impl App {
             }
             Msg::FortiFailed { idx, err } => self.fail(idx, err),
 
+            Msg::SessionKillDone { path, level, text } => {
+                match path {
+                    Some(path) => {
+                        self.killing_sessions.remove(&path);
+                    }
+                    None => self.killing_all = false,
+                }
+                self.toast(level, text);
+            }
+
             Msg::Poll(snapshot) => self.reconcile(*snapshot),
         }
     }
@@ -1404,7 +1648,10 @@ impl App {
             .collect();
 
         for idx in 0..self.profiles.len() {
-            if self.profiles[idx].kind != Kind::Forti || self.profiles[idx].state.is_busy() {
+            if self.profiles[idx].kind != Kind::Forti
+                || self.profiles[idx].placeholder
+                || self.profiles[idx].state.is_busy()
+            {
                 continue;
             }
             let adopted = self.profiles[idx].adopted;
@@ -1504,33 +1751,48 @@ impl App {
             .map(|i| i.name.clone())
     }
 
-    /// Perfiles conectados / total.
+    /// Perfiles conectados / total (las filas "No Configurada" no cuentan).
     pub fn summary(&self) -> (usize, usize) {
+        let real = self.profiles.iter().filter(|p| !p.placeholder);
         (
-            self.profiles.iter().filter(|p| p.state.is_up()).count(),
-            self.profiles.len(),
+            real.clone().filter(|p| p.state.is_up()).count(),
+            real.count(),
         )
     }
 }
 
-fn build_profiles(openvpn: &[OpenVpnProfile], forti: &[FortiProfile]) -> Vec<Profile> {
+/// Construye las filas del panel VPNS. Un tipo sin perfiles NO desaparece:
+/// deja una fila "…No Configurada" que lleva al asistente, para que se pueda
+/// descubrir desde el propio panel.
+pub fn build_profiles(openvpn: &[OpenVpnProfile], forti: &[FortiProfile]) -> Vec<Profile> {
     let mut profiles = Vec::new();
+    if openvpn.is_empty() {
+        profiles.push(Profile::placeholder(Kind::OpenVpn));
+    }
     for (i, p) in openvpn.iter().enumerate() {
         profiles.push(Profile::new(
-            p.name.clone(),
+            display_name(Kind::OpenVpn, p.name.as_deref()),
             Kind::OpenVpn,
             i,
             p.config.to_string_lossy().into_owned(),
         ));
     }
+    if forti.is_empty() {
+        profiles.push(Profile::placeholder(Kind::Forti));
+    }
     for (i, p) in forti.iter().enumerate() {
-        profiles.push(Profile::new(p.name.clone(), Kind::Forti, i, p.host.clone()));
+        profiles.push(Profile::new(
+            display_name(Kind::Forti, p.name.as_deref()),
+            Kind::Forti,
+            i,
+            p.host.clone(),
+        ));
     }
     // Tailscale no es una lista de perfiles — es una sola conexión de este
     // equipo — pero vive en el mismo panel "VPNS", así que se representa
     // como una única fila sintética; `cfg_index` no se usa para este `Kind`.
     profiles.push(Profile::new(
-        "Tailscale".to_string(),
+        Kind::Tailscale.label().to_string(),
         Kind::Tailscale,
         0,
         "tailscale".to_string(),
@@ -1544,5 +1806,159 @@ fn short(path: &str) -> String {
         Some((_, id)) if id.len() > 12 => format!("…{}", &id[id.len() - 12..]),
         Some((_, id)) => id.to_string(),
         None => path.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn ovpn(id: i64, name: Option<&str>) -> OpenVpnProfile {
+        OpenVpnProfile {
+            id,
+            name: name.map(str::to_string),
+            config: Path::new("/x/a.ovpn").to_path_buf(),
+        }
+    }
+
+    fn forti(id: i64, name: Option<&str>) -> FortiProfile {
+        FortiProfile {
+            id,
+            name: name.map(str::to_string),
+            host: "h:443".into(),
+            username: "u".into(),
+            password: None,
+            password_env: None,
+            trusted_cert: None,
+            extra_args: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn nombre_visible_antepone_el_tipo() {
+        assert_eq!(display_name(Kind::OpenVpn, Some("thinkpad")), "OpenVPN3 (thinkpad)");
+        assert_eq!(display_name(Kind::OpenVpn, None), "OpenVPN3");
+        // Un nombre en blanco cuenta como "sin nombre".
+        assert_eq!(display_name(Kind::Forti, Some("  ")), "OpenFortiVPN");
+        assert_eq!(display_name(Kind::Tailscale, None), "Tailscale");
+        assert_eq!(unconfigured_name(Kind::Forti), "OpenFortiVPN No Configurada");
+    }
+
+    #[test]
+    fn el_nombre_es_obligatorio_a_partir_del_segundo_perfil() {
+        // 0 → 1: sin nombre está bien, el tipo alcanza para identificarlo.
+        assert_eq!(validate_profile_name(0, ""), Ok(None));
+        // 1 → 2 sin nombre: quedarían dos filas idénticas.
+        assert!(validate_profile_name(1, "   ").is_err());
+        // 1 → 2 con nombre: correcto.
+        assert_eq!(
+            validate_profile_name(1, " casa "),
+            Ok(Some("casa".to_string()))
+        );
+    }
+
+    #[test]
+    fn un_tipo_sin_perfiles_deja_fila_no_configurada() {
+        let rows = build_profiles(&[], &[]);
+        let names: Vec<&str> = rows.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "OpenVPN3 No Configurada",
+                "OpenFortiVPN No Configurada",
+                "Tailscale"
+            ]
+        );
+        assert!(rows[0].placeholder && rows[1].placeholder);
+        assert!(!rows[2].placeholder, "Tailscale siempre es una fila real");
+    }
+
+    #[test]
+    fn con_perfiles_desaparece_el_placeholder_de_ese_tipo() {
+        let rows = build_profiles(&[ovpn(1, Some("thinkpad")), ovpn(2, None)], &[forti(3, None)]);
+        let names: Vec<&str> = rows.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "OpenVPN3 (thinkpad)",
+                "OpenVPN3",
+                "OpenFortiVPN",
+                "Tailscale"
+            ]
+        );
+        assert!(rows.iter().all(|p| !p.placeholder));
+    }
+
+    #[test]
+    fn el_foco_cicla_entre_los_tres_paneles() {
+        assert_eq!(Focus::Profiles.next(), Focus::Logs);
+        assert_eq!(Focus::Logs.next(), Focus::ConfigButton);
+        assert_eq!(Focus::ConfigButton.next(), Focus::Profiles);
+        assert_eq!(Focus::Profiles.prev(), Focus::ConfigButton);
+        assert_eq!(Focus::ConfigButton.prev(), Focus::Logs);
+    }
+
+    fn test_app() -> App {
+        let (tx, rx) = std::sync::mpsc::channel();
+        // El receptor se mantiene vivo: si se cierra, los `send` de la app
+        // fallarían silenciosamente y el test dejaría de reflejar la realidad.
+        std::mem::forget(rx);
+        App::new(Db::open_in_memory().unwrap(), tx)
+    }
+
+    /// Sin ningún perfil, la app entra directo al asistente en OpenVPN3, y el
+    /// carrusel da la vuelta en ambos sentidos.
+    #[test]
+    fn el_slider_del_asistente_arranca_en_openvpn_y_da_la_vuelta() {
+        let mut app = test_app();
+        assert_eq!(app.screen, Screen::Setup(Kind::OpenVpn));
+
+        app.setup_slide(true);
+        assert_eq!(app.screen, Screen::Setup(Kind::Forti));
+        app.setup_slide(true);
+        assert_eq!(app.screen, Screen::Setup(Kind::Tailscale));
+        app.setup_slide(true);
+        assert_eq!(app.screen, Screen::Setup(Kind::OpenVpn), "da la vuelta");
+        app.setup_slide(false);
+        assert_eq!(app.screen, Screen::Setup(Kind::Tailscale));
+    }
+
+    /// `enter` sobre una fila "No Configurada" lleva al asistente en ese tipo,
+    /// en vez de intentar conectar algo que no existe.
+    #[test]
+    fn enter_sobre_fila_no_configurada_abre_el_asistente() {
+        let mut app = test_app();
+        app.screen = Screen::Dashboard;
+        let forti_idx = app
+            .profiles
+            .iter()
+            .position(|p| p.kind == Kind::Forti)
+            .unwrap();
+        assert!(app.profiles[forti_idx].placeholder);
+
+        app.toggle(forti_idx);
+        assert_eq!(app.screen, Screen::Setup(Kind::Forti));
+    }
+
+    /// Guardar desde el asistente usa el mismo formulario del menú de config,
+    /// solo que recordando que debe volver al dashboard.
+    #[test]
+    fn el_asistente_reusa_el_formulario_de_config() {
+        let mut app = test_app();
+        app.enter_setup(Kind::Forti);
+        app.setup_confirm();
+        assert_eq!(app.screen, Screen::Config(ConfigScreen::ProfileForm));
+        let form = app.profile_form.as_ref().unwrap();
+        assert_eq!(form.kind, Kind::Forti);
+        assert_eq!(form.origin, FormOrigin::Setup);
+    }
+
+    /// Las filas "No Configurada" no cuentan como VPNs en el encabezado.
+    #[test]
+    fn el_resumen_ignora_los_placeholders() {
+        let app = test_app();
+        // Solo la fila real de Tailscale cuenta.
+        assert_eq!(app.summary(), (0, 1));
     }
 }

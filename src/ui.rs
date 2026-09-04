@@ -25,12 +25,43 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.screen {
         Screen::Dashboard => draw_dashboard(frame, app),
         Screen::Tailscale(screen) => draw_tailscale(frame, app, screen),
-        Screen::Config(screen) => draw_config(frame, app, screen),
+        // La configuración y el asistente son modales: el dashboard se sigue
+        // viendo detrás para no perder de vista el estado de las conexiones.
+        Screen::Config(screen) => {
+            draw_dashboard(frame, app);
+            draw_config(frame, app, screen);
+        }
+        Screen::Setup(kind) => {
+            draw_dashboard(frame, app);
+            draw_setup(frame, app, kind);
+        }
     }
 
     if app.show_help {
         draw_help(frame, frame.area());
     }
+}
+
+/// Marco común de todos los modales: recorta el fondo y devuelve el área
+/// interior ya dividida en cuerpo + pie de teclas.
+fn modal(frame: &mut Frame, title: &str, width_pct: u16, height_pct: u16) -> (Rect, Rect) {
+    let area = frame.area();
+    let width = (area.width * width_pct / 100).clamp(30, area.width.saturating_sub(2));
+    let height = (area.height * height_pct / 100).clamp(8, area.height.saturating_sub(2));
+    let popup = center(area, width, height);
+
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(ACCENT))
+        .title(Span::styled(format!(" {title} "), Style::new().fg(ACCENT).bold()));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let [body, footer] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(inner);
+    (body, footer)
 }
 
 // ----------------------------------------------------------------- dashboard
@@ -49,7 +80,12 @@ fn draw_dashboard(frame: &mut Frame, app: &mut App) {
     let [left, right] =
         Layout::horizontal([Constraint::Length(sidebar), Constraint::Min(20)]).areas(body);
 
-    draw_profiles(frame, app, left);
+    // La columna izquierda es la lista de VPNs con el botón de configuración
+    // debajo: es un panel más del recorrido de ←/→, no una tecla escondida.
+    let [list_area, config_button] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(left);
+    draw_profiles(frame, app, list_area);
+    draw_config_button(frame, app, config_button);
 
     let detail_height = DETAIL_HEIGHT.min(right.height.saturating_sub(4));
     let [detail, logs] =
@@ -150,6 +186,20 @@ fn draw_profiles(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|&i| &app.profiles[i])
         .map(|p| {
+            // Una fila "No Configurada" no tiene estado que mostrar: se ve
+            // apagada y explica que enter lleva a configurarla.
+            if p.placeholder {
+                let line = Line::from(vec![
+                    Span::styled("＋ ", Style::new().fg(MUTED)),
+                    Span::styled(p.name.clone(), Style::new().fg(MUTED).bold()),
+                ]);
+                let sub = Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled("enter para configurar", Style::new().fg(MUTED)),
+                ]);
+                return ListItem::new(Text::from(vec![line, sub]));
+            }
+
             let (icon, color) = state_style(&p.state, ticks);
             let time = p
                 .elapsed()
@@ -193,6 +243,29 @@ fn draw_profiles(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+fn draw_config_button(frame: &mut Frame, app: &App, area: Rect) {
+    let focused = app.focus == Focus::ConfigButton;
+    let style = if focused {
+        Style::new().fg(Color::Black).bg(ACCENT).bold()
+    } else {
+        Style::new().fg(MUTED)
+    };
+    let label = Line::from(vec![Span::styled(
+        if focused {
+            " ⚙  configuración  ↵ "
+        } else {
+            " ⚙  configuración "
+        },
+        style,
+    )])
+    .centered();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(if focused { ACCENT } else { MUTED }));
+    frame.render_widget(Paragraph::new(label).block(block), area);
+}
+
 fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
     let block = panel("detalle", false).padding(Padding::new(1, 1, 0, 0));
     let Some(p) = app.selected_profile() else {
@@ -203,6 +276,23 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
         );
         return;
     };
+
+    if p.placeholder {
+        let lines = vec![
+            field("tipo", Span::raw(p.kind.label())),
+            field(
+                "estado",
+                Span::styled("no configurada", Style::new().fg(MUTED).bold()),
+            ),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  enter abre el asistente para configurar este tipo de VPN",
+                Style::new().fg(MUTED),
+            )),
+        ];
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
 
     let (_, color) = state_style(&p.state, app.ticks);
     let kind = p.kind.label();
@@ -408,13 +498,13 @@ fn draw_dashboard_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let keys = [
-        ("↑↓/jk", "mover"),
+        ("↑↓", "mover"),
+        ("←→", "panel"),
         ("1/2/3", "saltar a tipo"),
         ("enter", "conectar/cortar"),
         ("a", "todas"),
         ("x", "cortar todas"),
-        ("tab", "panel"),
-        ("F2", "config"),
+        ("⚙", "config (←→ hasta el botón)"),
         ("?", "ayuda"),
         ("esc/q", "salir"),
     ];
@@ -435,21 +525,21 @@ fn render_key_hints(frame: &mut Frame, area: Rect, keys: &[(&str, &str)]) {
 
 fn draw_help(frame: &mut Frame, area: Rect) {
     let rows: [(&str, &str); 16] = [
+        ("← / →", "cambiar de panel (VPNS, registro, ⚙ configuración)"),
+        ("↑ / k, ↓ / j", "moverse en listas / desplazar el registro"),
         ("1 / 2 / 3", "saltar selección a OpenVPN3 / OpenFortiVPN / Tailscale"),
-        ("F2", "menú de configuración"),
-        ("? / F1", "abrir o cerrar esta ayuda"),
-        ("↑ / k, ↓ / j", "moverse en listas"),
-        ("enter / space", "conectar, desconectar, confirmar"),
+        ("enter / space", "conectar, desconectar, confirmar, abrir ⚙"),
         ("c / d", "conectar / desconectar el seleccionado"),
         ("a", "conectar todos"),
         ("x", "desconectar todos"),
         ("e", "exit-node de Tailscale (con Tailscale seleccionado)"),
         ("R", "rutas anunciadas de Tailscale (con Tailscale seleccionado)"),
         ("n / e / x", "nuevo / editar / borrar perfil (listas de config)"),
-        ("F3", "buscar archivo (campos de ruta)"),
-        ("tab / shift-tab", "siguiente / anterior campo o panel"),
+        ("F3", "elegir archivo (zona de importación)"),
+        ("tab / shift-tab", "siguiente / anterior campo (dentro de un formulario)"),
         ("pgup / pgdn, g / G", "desplazar el registro"),
         ("r", "limpiar el registro"),
+        ("? / F1", "abrir o cerrar esta ayuda"),
         ("q / esc / ctrl-c", "atrás / salir"),
     ];
 
@@ -577,7 +667,108 @@ fn draw_config(frame: &mut Frame, app: &mut App, screen: ConfigScreen) {
         ConfigScreen::General => draw_general(frame, app),
         ConfigScreen::Ipv6Status => draw_ipv6_status(frame, app),
         ConfigScreen::OpenVpnSessions => draw_sessions(frame, app),
+        ConfigScreen::ConfirmDelete { kind, idx } => draw_confirm_delete(frame, app, kind, idx),
     }
+}
+
+/// Asistente de primera configuración: un carrusel con un pane por tipo. El
+/// indicador (‹ ● ○ ○ ›) es explícito para que se lea como deslizable y no
+/// como una pantalla fija.
+fn draw_setup(frame: &mut Frame, app: &App, kind: Kind) {
+    let (body, footer) = modal(frame, "configurar VPN", 70, 60);
+
+    let [tabs, content] =
+        Layout::vertical([Constraint::Length(2), Constraint::Min(3)]).areas(body);
+
+    let mut spans = vec![Span::styled("  ‹  ", Style::new().fg(ACCENT).bold())];
+    for k in Kind::ALL {
+        let current = k == kind;
+        spans.push(Span::styled(
+            if current { "● " } else { "○ " },
+            Style::new().fg(if current { ACCENT } else { MUTED }),
+        ));
+        spans.push(Span::styled(
+            format!("{}  ", k.label()),
+            if current {
+                Style::new().fg(Color::White).bold()
+            } else {
+                Style::new().fg(MUTED)
+            },
+        ));
+    }
+    spans.push(Span::styled("  ›", Style::new().fg(ACCENT).bold()));
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(spans).centered(),
+            Line::from(Span::styled(
+                "usa ← → para ver los otros tipos de VPN",
+                Style::new().fg(MUTED),
+            ))
+            .centered(),
+        ]),
+        tabs,
+    );
+
+    let configured = match kind {
+        Kind::OpenVpn => !app.openvpn_profiles.is_empty(),
+        Kind::Forti => !app.forti_profiles.is_empty(),
+        Kind::Tailscale => app
+            .tailscale_status
+            .as_ref()
+            .map(|s| s.is_running())
+            .unwrap_or(false),
+    };
+
+    let lines = match kind {
+        Kind::OpenVpn => vec![
+            Line::from(Span::styled(
+                "  Importa un archivo .ovpn para crear tu primer perfil.",
+                Style::new().fg(Color::White),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  enter → abre el formulario con la zona de importación",
+                Style::new().fg(MUTED),
+            )),
+        ],
+        Kind::Forti => vec![
+            Line::from(Span::styled(
+                "  Captura host, usuario y contraseña de tu FortiGate.",
+                Style::new().fg(Color::White),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  enter → abre el formulario de OpenFortiVPN",
+                Style::new().fg(MUTED),
+            )),
+        ],
+        Kind::Tailscale => vec![
+            Line::from(Span::styled(
+                "  Tailscale no usa perfiles: basta con levantarlo en este equipo.",
+                Style::new().fg(Color::White),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  enter → tailscale up",
+                Style::new().fg(MUTED),
+            )),
+        ],
+    };
+    let mut lines = lines;
+    if configured {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  ✓ este tipo ya está configurado",
+            Style::new().fg(Color::Green),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), content);
+
+    render_key_hints(
+        frame,
+        footer,
+        &[("←→", "cambiar tipo"), ("enter", "configurar"), ("esc", "salir")],
+    );
 }
 
 const CONFIG_MENU_ITEMS: [&str; 5] = [
@@ -589,51 +780,60 @@ const CONFIG_MENU_ITEMS: [&str; 5] = [
 ];
 
 fn draw_config_menu(frame: &mut Frame, app: &App) {
-    let [body, footer] =
-        Layout::vertical([Constraint::Min(6), Constraint::Length(1)]).areas(frame.area());
+    let (body, footer) = modal(frame, "configuración", 60, 60);
 
     let items: Vec<ListItem> = CONFIG_MENU_ITEMS
         .iter()
         .map(|s| ListItem::new(format!("  {s}")))
         .collect();
-    let block = panel("configuración", true);
-    let list = List::new(items).block(block).highlight_style(
+    let list = List::new(items).highlight_style(
         Style::new().bg(Color::Indexed(236)).add_modifier(Modifier::BOLD),
     );
     let mut state = ListState::default();
     state.select(Some(app.config_menu_selected));
     frame.render_stateful_widget(list, body, &mut state);
 
-    render_key_hints(frame, footer, &[("↑↓", "mover"), ("enter", "entrar"), ("esc/q", "menú principal")]);
+    render_key_hints(frame, footer, &[("↑↓", "mover"), ("enter", "entrar"), ("esc", "cerrar")]);
 }
 
 fn draw_profile_list(frame: &mut Frame, app: &App, kind: Kind) {
-    let [body, footer] =
-        Layout::vertical([Constraint::Min(6), Constraint::Length(1)]).areas(frame.area());
+    let title = format!("perfiles {}", kind.label());
+    let (body, footer) = modal(frame, &title, 70, 60);
 
     let items: Vec<ListItem> = match kind {
         Kind::OpenVpn => app
             .openvpn_profiles
             .iter()
-            .map(|p| ListItem::new(format!("  {}  {}", p.name, p.config.display())))
+            .map(|p| {
+                ListItem::new(format!(
+                    "  {}  {}",
+                    crate::app::display_name(kind, p.name.as_deref()),
+                    p.config.display()
+                ))
+            })
             .collect(),
         Kind::Forti => app
             .forti_profiles
             .iter()
-            .map(|p| ListItem::new(format!("  {}  {}@{}", p.name, p.username, p.host)))
+            .map(|p| {
+                ListItem::new(format!(
+                    "  {}  {}@{}",
+                    crate::app::display_name(kind, p.name.as_deref()),
+                    p.username,
+                    p.host
+                ))
+            })
             .collect(),
         // El menú de config nunca abre esta pantalla con Kind::Tailscale.
         Kind::Tailscale => Vec::new(),
     };
-    let title = format!("perfiles {}", kind.label());
-    let block = panel(&title, true);
     if items.is_empty() {
         frame.render_widget(
-            Paragraph::new("  sin perfiles — pulsa 'n' para agregar uno").block(block),
+            Paragraph::new("  sin perfiles — pulsa 'n' para agregar uno"),
             body,
         );
     } else {
-        let list = List::new(items).block(block).highlight_style(
+        let list = List::new(items).highlight_style(
             Style::new().bg(Color::Indexed(236)).add_modifier(Modifier::BOLD),
         );
         let mut state = ListState::default();
@@ -655,51 +855,124 @@ fn draw_profile_list(frame: &mut Frame, app: &App, kind: Kind) {
 }
 
 fn draw_profile_form(frame: &mut Frame, app: &App) {
-    let [body, footer] =
-        Layout::vertical([Constraint::Min(6), Constraint::Length(1)]).areas(frame.area());
-
     let Some(form) = &app.profile_form else {
         return;
     };
     let title = match form.editing_id {
-        Some(_) => "editar perfil",
-        None => "nuevo perfil",
+        Some(_) => format!("editar perfil {}", form.kind.label()),
+        None => format!("nuevo perfil {}", form.kind.label()),
     };
-    let block = panel(title, true).padding(Padding::new(1, 1, 1, 0));
-    let inner = block.inner(body);
-    frame.render_widget(block, body);
+    let (body, footer) = modal(frame, &title, 72, 70);
+
+    // Los campos de ruta se dibujan como zona de importación (dropzone), con
+    // su propio recuadro: es lo primero que busca el ojo al dar de alta un
+    // .ovpn, y antes se perdía como una línea más del formulario.
+    let dropzones = form.fields.iter().filter(|f| f.pickable).count() as u16;
+    let text_rows = (form.fields.len() as u16 - dropzones) + 2;
+    let [text_area, drop_area, _] = Layout::vertical([
+        Constraint::Length(text_rows),
+        Constraint::Length(if dropzones > 0 { 4 } else { 0 }),
+        Constraint::Min(0),
+    ])
+    .areas(body);
 
     let mut lines: Vec<Line> = Vec::new();
     for (i, field) in form.fields.iter().enumerate() {
+        if field.pickable {
+            continue;
+        }
         let focused = i == form.focus;
         let value = if field.mask {
             "•".repeat(field.input.value().chars().count())
         } else {
             field.input.value().to_string()
         };
-        let marker = if focused { "▶ " } else { "  " };
         lines.push(Line::from(vec![
-            Span::styled(marker, Style::new().fg(ACCENT)),
+            Span::styled(if focused { "▶ " } else { "  " }, Style::new().fg(ACCENT)),
             Span::styled(format!("{:<24}", field.label), Style::new().fg(MUTED)),
-            Span::styled(value, if focused { Style::new().fg(Color::White).bold() } else { Style::new().fg(Color::White) }),
+            Span::styled(
+                value,
+                if focused {
+                    Style::new().fg(Color::White).bold()
+                } else {
+                    Style::new().fg(Color::White)
+                },
+            ),
         ]));
     }
     if let Some(err) = &form.error {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(format!("  {err}"), Style::new().fg(Color::Red))));
+        lines.push(Line::from(Span::styled(
+            format!("  {err}"),
+            Style::new().fg(Color::Red),
+        )));
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines), text_area);
+
+    if let Some((i, field)) = form.fields.iter().enumerate().find(|(_, f)| f.pickable) {
+        draw_dropzone(frame, drop_area, field.label, field.input.value(), i == form.focus);
+    }
 
     let pickable = form.fields.get(form.focus).map(|f| f.pickable).unwrap_or(false);
-    let mut keys = vec![("tab/shift-tab", "campo"), ("enter", "guardar"), ("esc", "cancelar")];
+    let mut keys = vec![
+        ("tab", "campo"),
+        ("enter", "guardar"),
+        ("esc", "cancelar"),
+    ];
     if pickable {
-        keys.insert(1, ("F3", "buscar archivo"));
+        keys.insert(1, ("F3", "elegir archivo"));
     }
     render_key_hints(frame, footer, &keys);
 }
 
+/// Zona de importación de archivo: recuadro propio, ícono y una instrucción
+/// explícita. Sin esto el campo de ruta no se leía como "aquí va un archivo".
+fn draw_dropzone(frame: &mut Frame, area: Rect, label: &str, value: &str, focused: bool) {
+    if area.height < 3 {
+        return;
+    }
+    let border = if focused { ACCENT } else { MUTED };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::new().fg(border))
+        .title(Span::styled(
+            format!(" ⤓ {label} "),
+            Style::new().fg(border).bold(),
+        ))
+        .padding(Padding::new(1, 1, 0, 0));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines = if value.is_empty() {
+        vec![
+            Line::from(Span::styled(
+                "suelta aquí tu archivo .ovpn",
+                Style::new().fg(if focused { Color::White } else { MUTED }).bold(),
+            ))
+            .centered(),
+            Line::from(Span::styled(
+                "o pulsa F3 para buscarlo en el disco",
+                Style::new().fg(MUTED),
+            ))
+            .centered(),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled(value.to_string(), Style::new().fg(Color::White)))
+                .centered(),
+            Line::from(Span::styled(
+                "F3 para elegir otro",
+                Style::new().fg(MUTED),
+            ))
+            .centered(),
+        ]
+    };
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_file_picker(frame: &mut Frame, app: &App) {
-    let [body, footer] = Layout::vertical([Constraint::Min(6), Constraint::Length(1)]).areas(frame.area());
+    let (body, footer) = modal(frame, "elegir archivo .ovpn", 76, 80);
     if let Some(explorer) = &app.file_explorer {
         frame.render_widget_ref(explorer.widget(), body);
     }
@@ -707,11 +980,7 @@ fn draw_file_picker(frame: &mut Frame, app: &App) {
 }
 
 fn draw_general(frame: &mut Frame, app: &App) {
-    let [body, footer] =
-        Layout::vertical([Constraint::Min(6), Constraint::Length(1)]).areas(frame.area());
-    let block = panel("general", true).padding(Padding::new(1, 1, 1, 0));
-    let inner = block.inner(body);
-    frame.render_widget(block, body);
+    let (inner, footer) = modal(frame, "general", 76, 50);
 
     let Some(form) = &app.general_form else {
         return;
@@ -743,9 +1012,7 @@ fn draw_general(frame: &mut Frame, app: &App) {
 }
 
 fn draw_ipv6_status(frame: &mut Frame, app: &App) {
-    let [body, footer] =
-        Layout::vertical([Constraint::Min(6), Constraint::Length(1)]).areas(frame.area());
-    let block = panel("ipv6", true).padding(Padding::new(1, 1, 1, 0));
+    let (body, footer) = modal(frame, "ipv6", 66, 35);
 
     let (label, color) = match app.ipv6_disabled {
         Some(true) => ("deshabilitado", Color::Green),
@@ -760,32 +1027,41 @@ fn draw_ipv6_status(frame: &mut Frame, app: &App) {
             Style::new().fg(MUTED),
         )),
     ];
-    frame.render_widget(Paragraph::new(lines).block(block), body);
+    frame.render_widget(Paragraph::new(lines), body);
 
     render_key_hints(frame, footer, &[("t", "alternar"), ("esc/q", "atrás")]);
 }
 
 fn draw_sessions(frame: &mut Frame, app: &App) {
-    let [body, footer] =
-        Layout::vertical([Constraint::Min(6), Constraint::Length(1)]).areas(frame.area());
-    let block = panel("sesiones openvpn3 (todas, no solo las de esta TUI)", true);
+    let (body, footer) = modal(frame, "sesiones openvpn3 (todas, no solo las de esta TUI)", 80, 60);
+    let spinner = SPINNER[(app.ticks as usize) % SPINNER.len()];
 
     if app.all_openvpn_sessions.is_empty() {
-        frame.render_widget(Paragraph::new("  no hay sesiones activas").block(block), body);
+        frame.render_widget(Paragraph::new("  no hay sesiones activas"), body);
     } else {
         let items: Vec<ListItem> = app
             .all_openvpn_sessions
             .iter()
             .map(|s| {
+                // Mientras se está cerrando (una o todas) la fila lo dice con
+                // el mismo spinner que usan los perfiles al desconectarse.
+                let killing = app.killing_all || app.killing_sessions.contains(&s.path);
+                if killing {
+                    return ListItem::new(Line::from(vec![
+                        Span::styled(format!("  {spinner} "), Style::new().fg(Color::Yellow)),
+                        Span::styled(short_session(&s.path), Style::new().fg(Color::Yellow)),
+                        Span::styled("  cerrando…", Style::new().fg(Color::Yellow).bold()),
+                    ]));
+                }
                 ListItem::new(format!(
-                    "  {}  {}  {}",
+                    "  ● {}  {}  {}",
                     short_session(&s.path),
                     s.device.clone().unwrap_or_else(|| "-".into()),
                     s.status
                 ))
             })
             .collect();
-        let list = List::new(items).block(block).highlight_style(
+        let list = List::new(items).highlight_style(
             Style::new().bg(Color::Indexed(236)).add_modifier(Modifier::BOLD),
         );
         let mut state = ListState::default();
@@ -793,11 +1069,46 @@ fn draw_sessions(frame: &mut Frame, app: &App) {
         frame.render_stateful_widget(list, body, &mut state);
     }
 
+    if app.sessions_busy() {
+        let text = if app.killing_all {
+            format!(" {spinner} cerrando todas las sesiones…")
+        } else {
+            format!(" {spinner} cerrando la sesión…")
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                text,
+                Style::new().fg(Color::Yellow).bold(),
+            ))),
+            footer,
+        );
+        return;
+    }
+
     render_key_hints(
         frame,
         footer,
         &[("↑↓", "mover"), ("d", "matar seleccionada"), ("a", "matar todas"), ("esc/n", "cancelar")],
     );
+}
+
+fn draw_confirm_delete(frame: &mut Frame, app: &App, kind: Kind, idx: usize) {
+    let (body, footer) = modal(frame, "confirmar borrado", 66, 40);
+    let warning = app
+        .delete_warning(kind, idx)
+        .unwrap_or_else(|| "¿Borrar este perfil?".to_string());
+
+    let mut lines = vec![Line::from(Span::styled(
+        "  ⚠ esta acción no se puede deshacer",
+        Style::new().fg(Color::Yellow).bold(),
+    ))];
+    lines.push(Line::from(""));
+    for l in warning.lines() {
+        lines.push(Line::from(Span::raw(format!("  {l}"))));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), body);
+
+    render_key_hints(frame, footer, &[("s/enter", "borrar"), ("n/esc", "cancelar")]);
 }
 
 // ------------------------------------------------------------------ utilidades
