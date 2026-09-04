@@ -277,6 +277,28 @@ EOF
   ok "reglas sudo en $SUDOERS_FILE"
 }
 
+# --- tailscale sin sudo -------------------------------------------------------
+# `tailscale up/down/set` escriben las prefs de tailscaled y por defecto exigen
+# root ("Access denied: prefs write access denied"). El modo operator delega ese
+# permiso a un usuario concreto, que es justo lo que necesita la TUI para no
+# pedir contraseña. Como el instalador ya corre como root, se configura aquí en
+# vez de dejarle el comando suelto al usuario.
+configure_tailscale_operator() {
+  command -v tailscale >/dev/null || return 0
+  local current
+  current="$(tailscale debug prefs 2>/dev/null | sed -n 's/.*"OperatorUser": *"\([^"]*\)".*/\1/p' | head -1 || true)"
+  if [[ "$current" == "$TARGET_USER" ]]; then
+    ok "tailscale ya opera sin sudo para $TARGET_USER"
+    return 0
+  fi
+  if tailscale set --operator="$TARGET_USER" 2>/dev/null; then
+    ok "tailscale configurado para operar sin sudo como $TARGET_USER"
+  else
+    warn "no pude configurar el modo operator de tailscale (¿tailscaled detenido?)"
+    warn "hazlo después con: sudo tailscale set --operator=$TARGET_USER"
+  fi
+}
+
 main() {
   [[ $EUID -eq 0 ]] || die "este instalador escribe en $PREFIX y /etc/sudoers.d: ejecútalo con 'sudo ./install.sh'"
   info "vpn → usuario $TARGET_USER"
@@ -288,6 +310,7 @@ main() {
   install_desktop
   disable_old_alias
   install_sudoers
+  configure_tailscale_operator
   echo
   ok "listo — ejecuta: vpn"
 }
