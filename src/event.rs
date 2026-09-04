@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use ratatui::crossterm::event::{self as term, Event as TermEvent};
 
-use crate::vpn::{self, openvpn3, Iface, Stats};
+use crate::vpn::{self, openvpn3, tailscale, Iface, Stats};
 
 /// Severidad de una línea de log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +70,7 @@ pub struct Snapshot {
     pub forti_pids: Vec<u32>,
     pub interfaces: Vec<Iface>,
     pub ipv6_disabled: Option<bool>,
+    pub tailscale: Option<tailscale::Status>,
 }
 
 /// Canal único por el que llegan todos los mensajes al bucle principal.
@@ -139,6 +140,12 @@ fn collect_snapshot() -> Snapshot {
         .filter_map(|s| openvpn3::stats(&s.path).ok().map(|st| (s.path.clone(), st)))
         .collect();
 
+    let tailscale = if tailscale::is_available() {
+        tailscale::status().ok()
+    } else {
+        None
+    };
+
     Snapshot {
         openvpn_available,
         fortivpn_available,
@@ -147,5 +154,6 @@ fn collect_snapshot() -> Snapshot {
         forti_pids: crate::vpn::fortivpn::running_pids(),
         interfaces: vpn::tunnel_interfaces(),
         ipv6_disabled: vpn::ipv6_disabled(),
+        tailscale,
     }
 }

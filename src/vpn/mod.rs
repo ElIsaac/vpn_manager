@@ -2,6 +2,7 @@
 
 pub mod fortivpn;
 pub mod openvpn3;
+pub mod tailscale;
 
 use std::io::Read;
 use std::process::{Command, Output, Stdio};

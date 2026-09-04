@@ -1,21 +1,25 @@
 [package]
 name = "vpn-tui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "TUI para gestionar conexiones OpenVPN3 y OpenFortiVPN"
+description = "TUI para gestionar OpenVPN3, OpenFortiVPN y Tailscale"
 license = "MIT"
 
 [[bin]]
-name = "vpn-tui"
+name = "vpn"
 path = "src/main.rs"
 
 [dependencies]
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "1"
 anyhow = "1"
 dirs = "6"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tui-input = "0.15.4"
+ratatui-explorer = "0.3.0"
 
 [profile.release]
 opt-level = "z"

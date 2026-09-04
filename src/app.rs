@@ -5,9 +5,12 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-use crate::config::Config;
+use ratatui_explorer::FileExplorer;
+use tui_input::Input;
+
+use crate::db::{Db, FortiProfile, General, OpenVpnProfile};
 use crate::event::{Level, Msg, Snapshot};
-use crate::vpn::{self, fortivpn, human_bytes, openvpn3, Iface, State, Stats};
+use crate::vpn::{self, fortivpn, human_bytes, openvpn3, tailscale, Iface, State, Stats};
 
 /// Muestras de velocidad que se conservan para las gráficas.
 const RATE_HISTORY: usize = 80;
@@ -21,11 +24,201 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub fn tag(&self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
-            Kind::OpenVpn => "OVPN",
-            Kind::Forti => "FORTI",
+            Kind::OpenVpn => "OpenVPN3",
+            Kind::Forti => "OpenFortiVPN",
         }
+    }
+}
+
+/// Pantalla visible. `MainMenu` es la entrada: solo "1) OpenVPN3 2)
+/// OpenFortiVPN 3) Tailscale" — todo lo demás vive en `Config`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    MainMenu,
+    Dashboard(Kind),
+    Tailscale(TailscaleScreen),
+    Config(ConfigScreen),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailscaleScreen {
+    Status,
+    ExitNodePicker,
+    RoutesForm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigScreen {
+    Menu,
+    ProfileList(Kind),
+    ProfileForm,
+    FilePicker,
+    General,
+    Ipv6Status,
+    OpenVpnSessions,
+}
+
+/// A qué campo vuelve la ruta elegida en el `FilePicker`.
+#[derive(Debug, Clone, Copy)]
+pub enum FileTarget {
+    /// Índice de campo dentro de `ProfileForm::fields`.
+    Profile(usize),
+    /// Índice de campo dentro de `GeneralForm` (0 = script deshabilitar IPv6,
+    /// 1 = script habilitar IPv6).
+    General(usize),
+}
+
+/// Un campo de texto editable en un formulario.
+pub struct FormField {
+    pub label: &'static str,
+    pub input: Input,
+    pub mask: bool,
+    /// Si `true`, este campo tiene una acción de "buscar archivo" (F3).
+    pub pickable: bool,
+}
+
+impl FormField {
+    fn new(label: &'static str, value: impl Into<String>) -> Self {
+        Self {
+            label,
+            input: Input::new(value.into()),
+            mask: false,
+            pickable: false,
+        }
+    }
+
+    fn masked(mut self) -> Self {
+        self.mask = true;
+        self
+    }
+
+    fn with_picker(mut self) -> Self {
+        self.pickable = true;
+        self
+    }
+}
+
+/// Formulario de alta/edición de un perfil (OpenVPN3 o FortiVPN).
+pub struct ProfileForm {
+    pub kind: Kind,
+    pub editing_id: Option<i64>,
+    pub fields: Vec<FormField>,
+    pub focus: usize,
+    pub error: Option<String>,
+}
+
+impl ProfileForm {
+    pub fn new_openvpn(existing: Option<&OpenVpnProfile>) -> Self {
+        let fields = vec![
+            FormField::new("nombre", existing.map(|p| p.name.clone()).unwrap_or_default()),
+            FormField::new(
+                "ruta .ovpn (F3 buscar)",
+                existing
+                    .map(|p| p.config.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            )
+            .with_picker(),
+        ];
+        Self {
+            kind: Kind::OpenVpn,
+            editing_id: existing.map(|p| p.id),
+            fields,
+            focus: 0,
+            error: None,
+        }
+    }
+
+    pub fn new_forti(existing: Option<&FortiProfile>) -> Self {
+        let fields = vec![
+            FormField::new("nombre", existing.map(|p| p.name.clone()).unwrap_or_default()),
+            FormField::new("host:puerto", existing.map(|p| p.host.clone()).unwrap_or_default()),
+            FormField::new("usuario", existing.map(|p| p.username.clone()).unwrap_or_default()),
+            FormField::new(
+                "password",
+                existing.and_then(|p| p.password.clone()).unwrap_or_default(),
+            )
+            .masked(),
+            FormField::new(
+                "password_env (opcional)",
+                existing.and_then(|p| p.password_env.clone()).unwrap_or_default(),
+            ),
+            FormField::new(
+                "trusted_cert (opcional)",
+                existing.and_then(|p| p.trusted_cert.clone()).unwrap_or_default(),
+            ),
+            FormField::new(
+                "extra_args (coma)",
+                existing.map(|p| p.extra_args.join(",")).unwrap_or_default(),
+            ),
+        ];
+        Self {
+            kind: Kind::Forti,
+            editing_id: existing.map(|p| p.id),
+            fields,
+            focus: 0,
+            error: None,
+        }
+    }
+
+    pub fn next_field(&mut self) {
+        if !self.fields.is_empty() {
+            self.focus = (self.focus + 1) % self.fields.len();
+        }
+    }
+
+    pub fn prev_field(&mut self) {
+        if !self.fields.is_empty() {
+            self.focus = (self.focus + self.fields.len() - 1) % self.fields.len();
+        }
+    }
+}
+
+/// Ajustes generales, editados como formulario dentro de `Config::General`.
+pub struct GeneralForm {
+    pub poll_interval_ms: Input,
+    pub log_capacity: Input,
+    pub ipv6_disable_script: Input,
+    pub ipv6_enable_script: Input,
+    pub ipv6_on_connect: bool,
+    pub focus: usize,
+}
+
+impl GeneralForm {
+    pub fn from(general: &General) -> Self {
+        Self {
+            poll_interval_ms: Input::new(general.poll_interval_ms.to_string()),
+            log_capacity: Input::new(general.log_capacity.to_string()),
+            ipv6_disable_script: Input::new(
+                general
+                    .ipv6_disable_script
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            ),
+            ipv6_enable_script: Input::new(
+                general
+                    .ipv6_enable_script
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            ),
+            ipv6_on_connect: general.ipv6_on_connect,
+            focus: 0,
+        }
+    }
+
+    /// Índices de campo: 0 poll_interval_ms, 1 log_capacity,
+    /// 2 ipv6_disable_script, 3 ipv6_enable_script, 4 toggle ipv6_on_connect.
+    pub const FIELD_COUNT: usize = 5;
+
+    pub fn next_field(&mut self) {
+        self.focus = (self.focus + 1) % Self::FIELD_COUNT;
+    }
+
+    pub fn prev_field(&mut self) {
+        self.focus = (self.focus + Self::FIELD_COUNT - 1) % Self::FIELD_COUNT;
     }
 }
 
@@ -34,7 +227,7 @@ impl Kind {
 pub struct Profile {
     pub name: String,
     pub kind: Kind,
-    /// Índice dentro de `cfg.openvpn` o `cfg.fortivpn`.
+    /// Índice dentro de `openvpn_profiles` o `forti_profiles`.
     pub cfg_index: usize,
     /// Ruta del `.ovpn` o `host:puerto`.
     pub target: String,
@@ -144,7 +337,12 @@ pub struct LogEntry {
 }
 
 pub struct App {
-    pub cfg: Config,
+    pub db: Db,
+    pub general: General,
+    pub openvpn_profiles: Vec<OpenVpnProfile>,
+    pub forti_profiles: Vec<FortiProfile>,
+
+    pub screen: Screen,
     pub profiles: Vec<Profile>,
     pub selected: usize,
     pub logs: VecDeque<LogEntry>,
@@ -161,26 +359,39 @@ pub struct App {
     pub ipv6_disabled: Option<bool>,
     pub openvpn_available: bool,
     pub fortivpn_available: bool,
+
+    // --- config: menú y subpantallas -----------------------------------
+    pub config_menu_selected: usize,
+    pub profile_list_selected: usize,
+    pub profile_form: Option<ProfileForm>,
+    pub general_form: Option<GeneralForm>,
+    pub file_explorer: Option<FileExplorer>,
+    pub file_target: Option<FileTarget>,
+    pub all_openvpn_sessions: Vec<openvpn3::Session>,
+    pub sessions_selected: usize,
+
+    // --- tailscale --------------------------------------------------------
+    pub tailscale_available: bool,
+    pub tailscale_status: Option<tailscale::Status>,
+    pub exit_node_selected: usize,
+    pub routes_input: Input,
+
     tx: Sender<Msg>,
 }
 
 impl App {
-    pub fn new(cfg: Config, tx: Sender<Msg>) -> Self {
-        let mut profiles = Vec::new();
-        for (i, p) in cfg.openvpn.iter().enumerate() {
-            profiles.push(Profile::new(
-                p.name.clone(),
-                Kind::OpenVpn,
-                i,
-                p.config.to_string_lossy().into_owned(),
-            ));
-        }
-        for (i, p) in cfg.fortivpn.iter().enumerate() {
-            profiles.push(Profile::new(p.name.clone(), Kind::Forti, i, p.host.clone()));
-        }
+    pub fn new(db: Db, tx: Sender<Msg>) -> Self {
+        let general = db.general().unwrap_or_default();
+        let openvpn_profiles = db.openvpn_profiles().unwrap_or_default();
+        let forti_profiles = db.forti_profiles().unwrap_or_default();
+        let profiles = build_profiles(&openvpn_profiles, &forti_profiles);
 
         let mut app = Self {
-            cfg,
+            db,
+            general,
+            openvpn_profiles,
+            forti_profiles,
+            screen: Screen::MainMenu,
             profiles,
             selected: 0,
             logs: VecDeque::new(),
@@ -195,10 +406,22 @@ impl App {
             ipv6_disabled: None,
             openvpn_available: true,
             fortivpn_available: true,
+            config_menu_selected: 0,
+            profile_list_selected: 0,
+            profile_form: None,
+            general_form: None,
+            file_explorer: None,
+            file_target: None,
+            all_openvpn_sessions: Vec::new(),
+            sessions_selected: 0,
+            tailscale_available: tailscale::is_available(),
+            tailscale_status: None,
+            exit_node_selected: 0,
+            routes_input: Input::default(),
             tx,
         };
-        let source = app.cfg.source.display().to_string();
-        app.log(None, Level::Info, format!("configuración: {source}"));
+        let source = app.db.source.display().to_string();
+        app.log(None, Level::Info, format!("base de datos: {source}"));
         app
     }
 
@@ -208,7 +431,7 @@ impl App {
         let profile = idx
             .and_then(|i| self.profiles.get(i))
             .map(|p| p.name.clone());
-        if self.logs.len() >= self.cfg.general.log_capacity {
+        if self.logs.len() >= self.general.log_capacity {
             self.logs.pop_front();
         }
         self.logs.push_back(LogEntry {
@@ -235,20 +458,42 @@ impl App {
 
     // ------------------------------------------------------------- navegación
 
+    /// Índices de `self.profiles` visibles en el `Dashboard` actual (filtrado
+    /// por tipo); fuera de un `Dashboard`, todos.
+    pub fn visible_profile_indices(&self) -> Vec<usize> {
+        match self.screen {
+            Screen::Dashboard(kind) => self
+                .profiles
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.kind == kind)
+                .map(|(i, _)| i)
+                .collect(),
+            _ => (0..self.profiles.len()).collect(),
+        }
+    }
+
     pub fn select_next(&mut self) {
-        if !self.profiles.is_empty() {
-            self.selected = (self.selected + 1) % self.profiles.len();
+        let n = self.visible_profile_indices().len();
+        if n > 0 {
+            self.selected = (self.selected + 1) % n;
         }
     }
 
     pub fn select_prev(&mut self) {
-        if !self.profiles.is_empty() {
-            self.selected = (self.selected + self.profiles.len() - 1) % self.profiles.len();
+        let n = self.visible_profile_indices().len();
+        if n > 0 {
+            self.selected = (self.selected + n - 1) % n;
         }
     }
 
+    /// Índice absoluto (en `self.profiles`) del elemento seleccionado.
+    pub fn selected_absolute(&self) -> Option<usize> {
+        self.visible_profile_indices().get(self.selected).copied()
+    }
+
     pub fn selected_profile(&self) -> Option<&Profile> {
-        self.profiles.get(self.selected)
+        self.selected_absolute().and_then(|i| self.profiles.get(i))
     }
 
     pub fn toggle_focus(&mut self) {
@@ -272,6 +517,293 @@ impl App {
 
     pub fn log_top(&mut self) {
         self.log_scroll = Some(0);
+    }
+
+    // ----------------------------------------------------------------- menús
+
+    pub fn enter_dashboard(&mut self, kind: Kind) {
+        self.screen = Screen::Dashboard(kind);
+        self.selected = 0;
+        self.focus = Focus::Profiles;
+    }
+
+    pub fn enter_tailscale(&mut self) {
+        self.screen = Screen::Tailscale(TailscaleScreen::Status);
+    }
+
+    pub fn enter_config_menu(&mut self) {
+        self.screen = Screen::Config(ConfigScreen::Menu);
+        self.config_menu_selected = 0;
+    }
+
+    pub fn back_to_main_menu(&mut self) {
+        self.screen = Screen::MainMenu;
+        self.profile_form = None;
+        self.general_form = None;
+        self.file_explorer = None;
+        self.file_target = None;
+    }
+
+    /// Si hay exactamente un perfil de `kind`, lo conecta de inmediato — usado
+    /// por `vpn 1` / `vpn 2` para saltar el menú principal.
+    pub fn autoconnect_single(&mut self, kind: Kind) {
+        let matches: Vec<usize> = self
+            .profiles
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.kind == kind)
+            .map(|(i, _)| i)
+            .collect();
+        if let [idx] = matches[..] {
+            self.connect(idx);
+        }
+    }
+
+    // ------------------------------------------------------------- perfiles
+
+    /// Reconstruye `self.profiles` desde la base de datos tras un alta/edición
+    /// /borrado. El estado de conexión en curso se pierde para el perfil
+    /// tocado, pero el siguiente sondeo (a lo más `poll_interval_ms`) vuelve a
+    /// adoptarlo si de verdad sigue conectado.
+    pub fn reload_profiles(&mut self) {
+        self.openvpn_profiles = self.db.openvpn_profiles().unwrap_or_default();
+        self.forti_profiles = self.db.forti_profiles().unwrap_or_default();
+        self.profiles = build_profiles(&self.openvpn_profiles, &self.forti_profiles);
+        self.selected = 0;
+    }
+
+    pub fn open_profile_form_new(&mut self, kind: Kind) {
+        self.profile_form = Some(match kind {
+            Kind::OpenVpn => ProfileForm::new_openvpn(None),
+            Kind::Forti => ProfileForm::new_forti(None),
+        });
+        self.screen = Screen::Config(ConfigScreen::ProfileForm);
+    }
+
+    pub fn open_profile_form_edit(&mut self, kind: Kind, list_idx: usize) {
+        let form = match kind {
+            Kind::OpenVpn => self
+                .openvpn_profiles
+                .get(list_idx)
+                .map(|p| ProfileForm::new_openvpn(Some(p))),
+            Kind::Forti => self
+                .forti_profiles
+                .get(list_idx)
+                .map(|p| ProfileForm::new_forti(Some(p))),
+        };
+        if let Some(form) = form {
+            self.profile_form = Some(form);
+            self.screen = Screen::Config(ConfigScreen::ProfileForm);
+        }
+    }
+
+    pub fn delete_profile(&mut self, kind: Kind, list_idx: usize) {
+        let result = match kind {
+            Kind::OpenVpn => self
+                .openvpn_profiles
+                .get(list_idx)
+                .map(|p| self.db.delete_openvpn_profile(p.id)),
+            Kind::Forti => self
+                .forti_profiles
+                .get(list_idx)
+                .map(|p| self.db.delete_forti_profile(p.id)),
+        };
+        match result {
+            Some(Ok(())) => {
+                self.toast(Level::Ok, "perfil borrado");
+                self.reload_profiles();
+            }
+            Some(Err(err)) => self.toast(Level::Error, format!("no pude borrar: {err}")),
+            None => {}
+        }
+    }
+
+    /// Guarda el `ProfileForm` abierto. `Ok(true)` si guardó y debe cerrarse.
+    pub fn save_profile_form(&mut self) -> bool {
+        let Some(form) = self.profile_form.as_mut() else {
+            return true;
+        };
+        let value = |i: usize| form.fields[i].input.value().trim().to_string();
+
+        let result = match form.kind {
+            Kind::OpenVpn => {
+                let name = value(0);
+                let path = value(1);
+                if name.is_empty() || path.is_empty() {
+                    form.error = Some("nombre y ruta son obligatorios".into());
+                    return false;
+                }
+                let config = PathBuf::from(&path);
+                if !config.is_file() {
+                    form.error = Some(format!("no encuentro el archivo {path}"));
+                    return false;
+                }
+                match form.editing_id {
+                    Some(id) => self.db.update_openvpn_profile(id, &name, &config),
+                    None => self.db.insert_openvpn_profile(&name, &config).map(|_| ()),
+                }
+            }
+            Kind::Forti => {
+                let name = value(0);
+                let host = value(1);
+                let username = value(2);
+                let password = value(3);
+                let password_env = value(4);
+                let trusted_cert = value(5);
+                let extra_args: Vec<String> = value(6)
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if name.is_empty() || host.is_empty() || username.is_empty() {
+                    form.error = Some("nombre, host y usuario son obligatorios".into());
+                    return false;
+                }
+                if password.is_empty() && password_env.is_empty() {
+                    form.error = Some("define `password` o `password_env`".into());
+                    return false;
+                }
+                let password = (!password.is_empty()).then_some(password.as_str());
+                let password_env = (!password_env.is_empty()).then_some(password_env.as_str());
+                let trusted_cert = (!trusted_cert.is_empty()).then_some(trusted_cert.as_str());
+                match form.editing_id {
+                    Some(id) => self.db.update_forti_profile(
+                        id,
+                        &name,
+                        &host,
+                        &username,
+                        password,
+                        password_env,
+                        trusted_cert,
+                        &extra_args,
+                    ),
+                    None => self
+                        .db
+                        .insert_forti_profile(
+                            &name,
+                            &host,
+                            &username,
+                            password,
+                            password_env,
+                            trusted_cert,
+                            &extra_args,
+                        )
+                        .map(|_| ()),
+                }
+            }
+        };
+
+        match result {
+            Ok(()) => {
+                self.reload_profiles();
+                self.profile_form = None;
+                self.toast(Level::Ok, "perfil guardado");
+                true
+            }
+            Err(err) => {
+                if let Some(form) = self.profile_form.as_mut() {
+                    form.error = Some(err.to_string());
+                }
+                false
+            }
+        }
+    }
+
+    /// Abre el explorador de archivos apuntando a `start` (o `~`), recordando
+    /// a qué campo debe volver la ruta elegida.
+    pub fn open_file_picker(&mut self, target: FileTarget, start: Option<&std::path::Path>) {
+        let mut explorer = match FileExplorer::new() {
+            Ok(e) => e,
+            Err(err) => {
+                self.toast(Level::Error, format!("no pude abrir el explorador: {err}"));
+                return;
+            }
+        };
+        if let Some(start) = start.filter(|p| p.is_dir()) {
+            let _ = explorer.set_cwd(start);
+        }
+        self.file_explorer = Some(explorer);
+        self.file_target = Some(target);
+        self.screen = Screen::Config(ConfigScreen::FilePicker);
+    }
+
+    /// Aplica la ruta elegida en el `FilePicker` al campo pendiente y regresa.
+    pub fn apply_picked_file(&mut self, path: PathBuf) {
+        match self.file_target {
+            Some(FileTarget::Profile(idx)) => {
+                if let Some(form) = self.profile_form.as_mut() {
+                    if let Some(field) = form.fields.get_mut(idx) {
+                        field.input = Input::new(path.to_string_lossy().into_owned());
+                    }
+                }
+                self.screen = Screen::Config(ConfigScreen::ProfileForm);
+            }
+            Some(FileTarget::General(idx)) => {
+                if let Some(form) = self.general_form.as_mut() {
+                    let value = path.to_string_lossy().into_owned();
+                    match idx {
+                        0 => form.ipv6_disable_script = Input::new(value),
+                        1 => form.ipv6_enable_script = Input::new(value),
+                        _ => {}
+                    }
+                }
+                self.screen = Screen::Config(ConfigScreen::General);
+            }
+            None => {}
+        }
+        self.file_explorer = None;
+        self.file_target = None;
+    }
+
+    pub fn cancel_file_picker(&mut self) {
+        self.file_explorer = None;
+        let back = match self.file_target.take() {
+            Some(FileTarget::Profile(_)) => ConfigScreen::ProfileForm,
+            Some(FileTarget::General(_)) | None => ConfigScreen::General,
+        };
+        self.screen = Screen::Config(back);
+    }
+
+    // ------------------------------------------------------- general (config)
+
+    pub fn open_general_form(&mut self) {
+        self.general_form = Some(GeneralForm::from(&self.general));
+        self.screen = Screen::Config(ConfigScreen::General);
+    }
+
+    pub fn save_general_form(&mut self) {
+        let Some(form) = self.general_form.take() else {
+            return;
+        };
+        let poll = form
+            .poll_interval_ms
+            .value()
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(self.general.poll_interval_ms)
+            .max(250);
+        let cap = form
+            .log_capacity
+            .value()
+            .trim()
+            .parse::<usize>()
+            .unwrap_or(self.general.log_capacity)
+            .max(100);
+        let disable_script = form.ipv6_disable_script.value().trim().to_string();
+        let enable_script = form.ipv6_enable_script.value().trim().to_string();
+
+        let _ = self.db.set_setting("poll_interval_ms", &poll.to_string());
+        let _ = self.db.set_setting("log_capacity", &cap.to_string());
+        let _ = self.db.set_setting("ipv6_disable_script", &disable_script);
+        let _ = self.db.set_setting("ipv6_enable_script", &enable_script);
+        let _ = self
+            .db
+            .set_setting("ipv6_on_connect", &form.ipv6_on_connect.to_string());
+
+        self.general = self.db.general().unwrap_or(self.general.clone());
+        self.toast(Level::Ok, "configuración guardada");
+        self.screen = Screen::Config(ConfigScreen::Menu);
     }
 
     // ----------------------------------------------------------------- acciones
@@ -314,7 +846,10 @@ impl App {
         let tx = self.tx.clone();
         match kind {
             Kind::OpenVpn => {
-                let config: PathBuf = self.cfg.openvpn[cfg_index].config.clone();
+                let Some(config) = self.openvpn_profiles.get(cfg_index).map(|p| p.config.clone())
+                else {
+                    return;
+                };
                 std::thread::spawn(move || match openvpn3::connect(&config) {
                     Ok(session) => {
                         let _ = tx.send(Msg::OvpnConnected { idx, session });
@@ -328,7 +863,9 @@ impl App {
                 });
             }
             Kind::Forti => {
-                let profile_cfg = self.cfg.fortivpn[cfg_index].clone();
+                let Some(profile_cfg) = self.forti_profiles.get(cfg_index).cloned() else {
+                    return;
+                };
                 std::thread::spawn(
                     move || match fortivpn::spawn(idx, &profile_cfg, tx.clone()) {
                         Ok(pid) => {
@@ -427,8 +964,10 @@ impl App {
         }
     }
 
-    pub fn connect_all(&mut self) {
+    /// Conecta todos los perfiles de `kind` (o todos si `kind` es `None`).
+    pub fn connect_all(&mut self, kind: Option<Kind>) {
         let targets: Vec<usize> = (0..self.profiles.len())
+            .filter(|i| kind.is_none_or(|k| self.profiles[*i].kind == k))
             .filter(|i| !self.profiles[*i].state.is_up() && !self.profiles[*i].state.is_busy())
             .collect();
         if targets.is_empty() {
@@ -444,8 +983,10 @@ impl App {
         }
     }
 
-    pub fn disconnect_all(&mut self) {
+    /// Desconecta todos los perfiles de `kind` (o todos si `kind` es `None`).
+    pub fn disconnect_all(&mut self, kind: Option<Kind>) {
         let targets: Vec<usize> = (0..self.profiles.len())
+            .filter(|i| kind.is_none_or(|k| self.profiles[*i].kind == k))
             .filter(|i| self.profiles[*i].state.is_up())
             .collect();
         if targets.is_empty() {
@@ -480,10 +1021,35 @@ impl App {
         }
     }
 
-    /// Ejecuta el script de IPv6 configurado.
+    /// Ejecuta el script de deshabilitar-IPv6 configurado (compatibilidad con
+    /// `ipv6_on_connect`). Para alternar en ambas direcciones ver
+    /// [`App::toggle_ipv6`].
     pub fn run_ipv6_script(&mut self) {
-        let Some(script) = self.cfg.general.ipv6_script.clone() else {
-            self.toast(Level::Warn, "no hay `ipv6_script` en la configuración");
+        self.run_ipv6_action(false);
+    }
+
+    /// Alterna IPv6: si está deshabilitado, corre `ipv6_enable_script`; si no,
+    /// `ipv6_disable_script`. Ambos scripts ya existen en `../vpns/` y no se
+    /// tocan desde aquí.
+    pub fn toggle_ipv6(&mut self) {
+        let disable = !self.ipv6_disabled.unwrap_or(false);
+        self.run_ipv6_action(disable);
+    }
+
+    fn run_ipv6_action(&mut self, disable: bool) {
+        let script = if disable {
+            self.general.ipv6_disable_script.clone()
+        } else {
+            self.general.ipv6_enable_script.clone()
+        };
+        let Some(script) = script else {
+            self.toast(
+                Level::Warn,
+                format!(
+                    "no hay script para {} IPv6 configurado (menú de config → General)",
+                    if disable { "deshabilitar" } else { "habilitar" }
+                ),
+            );
             return;
         };
         if !script.is_file() {
@@ -508,6 +1074,118 @@ impl App {
             };
             let _ = tx.send(msg);
         });
+    }
+
+    // ------------------------------------------------------- sesiones openvpn3
+
+    pub fn kill_selected_session(&mut self) {
+        let Some(session) = self.all_openvpn_sessions.get(self.sessions_selected).cloned() else {
+            return;
+        };
+        self.toast(Level::Info, format!("cerrando sesión {}…", short(&session.path)));
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let msg = match openvpn3::disconnect(&session.path) {
+                Ok(()) => Msg::Log(None, Level::Ok, "sesión cerrada".into()),
+                Err(err) => Msg::Log(None, Level::Error, format!("no pude cerrar la sesión: {err}")),
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    pub fn kill_all_sessions(&mut self) {
+        if self.all_openvpn_sessions.is_empty() {
+            self.toast(Level::Info, "no hay sesiones openvpn3 activas");
+            return;
+        }
+        let sessions = self.all_openvpn_sessions.clone();
+        self.toast(Level::Info, format!("cerrando {} sesión(es)…", sessions.len()));
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let msg = match openvpn3::disconnect_all(&sessions) {
+                Ok(()) => Msg::Log(None, Level::Ok, "todas las sesiones cerradas".into()),
+                Err(err) => Msg::Log(None, Level::Error, format!("alguna sesión no cerró: {err}")),
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    // ------------------------------------------------------------- tailscale
+
+    pub fn tailscale_toggle(&mut self) {
+        let running = self
+            .tailscale_status
+            .as_ref()
+            .map(tailscale::Status::is_running)
+            .unwrap_or(false);
+        self.toast(
+            Level::Info,
+            if running { "desconectando tailscale…" } else { "conectando tailscale…" },
+        );
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = if running { tailscale::down() } else { tailscale::up() };
+            let msg = match result {
+                Ok(()) => Msg::Log(None, Level::Ok, "tailscale: hecho".into()),
+                Err(err) => Msg::Log(None, Level::Error, format!("tailscale: {err}")),
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    /// Dispara `tailscale up` solo si el backend no está ya `Running` — usado
+    /// por `vpn 3` para saltar el menú sin reconectar de más.
+    ///
+    /// Al arrancar, `self.tailscale_status` todavía puede estar en `None`
+    /// (el primer sondeo periódico aún no llegó), así que aquí se consulta
+    /// el estado de una vez de forma síncrona en vez de asumir "no
+    /// conectado" — de lo contrario se dispararía un `up` innecesario cada
+    /// vez que ya estaba arriba.
+    pub fn tailscale_autoconnect(&mut self) {
+        let running = match &self.tailscale_status {
+            Some(status) => status.is_running(),
+            None => tailscale::status().map(|s| s.is_running()).unwrap_or(false),
+        };
+        if !running {
+            self.tailscale_toggle();
+        }
+    }
+
+    pub fn tailscale_apply_exit_node(&mut self, node_ip: Option<String>) {
+        self.toast(Level::Info, "aplicando exit-node…");
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let msg = match tailscale::set_exit_node(node_ip.as_deref()) {
+                Ok(()) => Msg::Log(None, Level::Ok, "exit-node actualizado".into()),
+                Err(err) => Msg::Log(None, Level::Error, format!("exit-node: {err}")),
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    pub fn tailscale_apply_routes(&mut self) {
+        let routes: Vec<String> = self
+            .routes_input
+            .value()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        self.toast(Level::Info, "aplicando rutas anunciadas…");
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let msg = match tailscale::set_advertise_routes(&routes) {
+                Ok(()) => Msg::Log(
+                    None,
+                    Level::Ok,
+                    "rutas actualizadas (falta aprobación del admin del tailnet)".into(),
+                ),
+                Err(err) => Msg::Log(None, Level::Error, format!("rutas: {err}")),
+            };
+            let _ = tx.send(msg);
+        });
+        self.screen = Screen::Tailscale(TailscaleScreen::Status);
     }
 
     // ------------------------------------------------------------- mensajería
@@ -599,7 +1277,7 @@ impl App {
     }
 
     fn after_connect(&mut self) {
-        if self.cfg.general.ipv6_on_connect {
+        if self.general.ipv6_on_connect {
             self.run_ipv6_script();
         }
     }
@@ -613,15 +1291,21 @@ impl App {
         self.fortivpn_available = snap.fortivpn_available;
         self.interfaces = snap.interfaces;
         self.ipv6_disabled = snap.ipv6_disabled;
+        self.all_openvpn_sessions = snap.sessions.clone();
+        self.tailscale_status = snap.tailscale;
 
         // --- OpenVPN3 --------------------------------------------------------
         for idx in 0..self.profiles.len() {
             if self.profiles[idx].kind != Kind::OpenVpn || self.profiles[idx].state.is_busy() {
                 continue;
             }
-            let config = self.cfg.openvpn[self.profiles[idx].cfg_index]
-                .config
-                .clone();
+            let Some(config) = self
+                .openvpn_profiles
+                .get(self.profiles[idx].cfg_index)
+                .map(|p| p.config.clone())
+            else {
+                continue;
+            };
             let known = self.profiles[idx].session_path.clone();
 
             let session = snap.sessions.iter().find(|s| {
@@ -765,11 +1449,43 @@ impl App {
             .map(|i| i.name.clone())
     }
 
-    /// Perfiles conectados / total.
+    /// Perfiles conectados / total (del `Kind` visible, o de todos).
     pub fn summary(&self) -> (usize, usize) {
-        (
-            self.profiles.iter().filter(|p| p.state.is_up()).count(),
-            self.profiles.len(),
-        )
+        match self.screen {
+            Screen::Dashboard(kind) => {
+                let visible: Vec<&Profile> =
+                    self.profiles.iter().filter(|p| p.kind == kind).collect();
+                (visible.iter().filter(|p| p.state.is_up()).count(), visible.len())
+            }
+            _ => (
+                self.profiles.iter().filter(|p| p.state.is_up()).count(),
+                self.profiles.len(),
+            ),
+        }
+    }
+}
+
+fn build_profiles(openvpn: &[OpenVpnProfile], forti: &[FortiProfile]) -> Vec<Profile> {
+    let mut profiles = Vec::new();
+    for (i, p) in openvpn.iter().enumerate() {
+        profiles.push(Profile::new(
+            p.name.clone(),
+            Kind::OpenVpn,
+            i,
+            p.config.to_string_lossy().into_owned(),
+        ));
+    }
+    for (i, p) in forti.iter().enumerate() {
+        profiles.push(Profile::new(p.name.clone(), Kind::Forti, i, p.host.clone()));
+    }
+    profiles
+}
+
+/// `/net/openvpn/v3/sessions/abc…` → `…/abc…`, para que quepa en pantalla.
+fn short(path: &str) -> String {
+    match path.rsplit_once('/') {
+        Some((_, id)) if id.len() > 12 => format!("…{}", &id[id.len() - 12..]),
+        Some((_, id)) => id.to_string(),
+        None => path.to_string(),
     }
 }

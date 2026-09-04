@@ -72,7 +72,21 @@ pub fn disconnect(session_path: &str) -> Result<()> {
 }
 
 /// Lista las sesiones activas; `Ok(vec![])` si no hay ninguna.
+///
+/// Es un alias de [`all_sessions`]: `openvpn3 sessions-list` ya reporta TODAS
+/// las sesiones vivas del usuario, coincidan o no con un perfil conocido de
+/// esta TUI — el filtrado por perfil lo hace [`matches_config`] en el llamador.
+/// Se mantiene el nombre corto para no tocar el resto del código que ya lo usa.
 pub fn sessions() -> Result<Vec<Session>> {
+    all_sessions()
+}
+
+/// Todas las sesiones OpenVPN3 vivas, sin filtrar por perfil conocido.
+///
+/// Es la base del "matador de sesiones" del menú de configuración: permite
+/// ver y cerrar sesiones huérfanas (p. ej. una reconexión en segundo plano de
+/// ayer que sigue viva) aunque esta TUI nunca las haya abierto.
+pub fn all_sessions() -> Result<Vec<Session>> {
     let out = run(BIN, &["sessions-list"], Duration::from_secs(10))?;
     let text = String::from_utf8_lossy(&out.stdout);
     // Sin sesiones, `openvpn3` devuelve un código distinto de cero.
@@ -80,6 +94,21 @@ pub fn sessions() -> Result<Vec<Session>> {
         return Ok(Vec::new());
     }
     Ok(parse_sessions(&text))
+}
+
+/// Cierra todas las sesiones dadas, devolviendo el error de la primera que
+/// falle (si alguna) pero intentando cerrar el resto de todos modos.
+pub fn disconnect_all(sessions: &[Session]) -> Result<()> {
+    let mut first_err = None;
+    for session in sessions {
+        if let Err(err) = disconnect(&session.path) {
+            first_err.get_or_insert(err);
+        }
+    }
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 /// Contadores de tráfico de una sesión.
@@ -236,6 +265,39 @@ Session name: vpn.example.com
         assert_eq!(s.config_name, "thinkpad.ovpn");
         assert_eq!(s.device.as_deref(), Some("tun0"));
         assert!(s.is_connected());
+    }
+
+    // Caso real de esta máquina: una sesión de un día anterior que seguía
+    // reconectando en segundo plano (tun1) más una segunda sesión abierta al
+    // día siguiente sin cerrar la primera (tun0). `all_sessions`/`parse_sessions`
+    // deben reportar ambas por separado para poder matarlas desde la TUI.
+    const LIST_DOS_SESIONES: &str = "\
+-----------------------------------------------------------------------------
+        Path: /net/openvpn/v3/sessions/aa51b41es36b3s438csb18bscd0ba667939d
+     Created: 2026-09-03 13:39:10                       PID: 418545
+       Owner: isaac                                  Device: tun1
+ Config name: /home/isaac/apps/vpns/thinkpad.ovpn
+Connected to: udp:66.115.177.199:1194
+      Status: Connection, Client connected
+-----------------------------------------------------------------------------
+        Path: /net/openvpn/v3/sessions/5bc7ca87t5da4t449dt80cet1df27a1a0b27
+     Created: 2026-09-04 11:11:53                       PID: 1027875
+       Owner: isaac                                  Device: tun0
+ Config name: /home/isaac/apps/vpns/thinkpad.ovpn
+Connected to: udp:66.115.177.197:1194
+      Status: Connection, Client connected
+-----------------------------------------------------------------------------
+";
+
+    #[test]
+    fn parsea_dos_sesiones_simultaneas() {
+        let sessions = parse_sessions(LIST_DOS_SESIONES);
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].device.as_deref(), Some("tun1"));
+        assert_eq!(sessions[0].path, "/net/openvpn/v3/sessions/aa51b41es36b3s438csb18bscd0ba667939d");
+        assert_eq!(sessions[1].device.as_deref(), Some("tun0"));
+        assert_eq!(sessions[1].path, "/net/openvpn/v3/sessions/5bc7ca87t5da4t449dt80cet1df27a1a0b27");
+        assert!(sessions.iter().all(Session::is_connected));
     }
 
     #[test]

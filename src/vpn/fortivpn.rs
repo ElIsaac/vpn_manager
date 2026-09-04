@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
-use crate::config::FortiProfile;
+use crate::db::FortiProfile;
 use crate::event::{Level, Msg};
 
 use super::{run, run_checked};
