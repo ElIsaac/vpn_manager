@@ -118,7 +118,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let mut spans = vec![
-        Span::styled(" VPNS ", Style::new().fg(Color::Black).bg(ACCENT).bold()),
+        Span::styled(" vpn ", Style::new().fg(Color::Black).bg(ACCENT).bold()),
         Span::raw("  "),
         Span::styled(
             format!("{up}/{total} activas"),
@@ -163,10 +163,8 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(MUTED))
-        .title(Line::from(vec![Span::styled(
-            " VPNS ",
-            Style::new().fg(ACCENT).bold(),
-        )]))
+        // Sin título propio: la insignia " vpn " de adentro ya identifica la app,
+        // y repetirlo chocaba con el título del panel de la izquierda.
         .title_bottom(
             Line::from(Span::styled(
                 format!(" {} ", chrono::Local::now().format("%H:%M:%S")),

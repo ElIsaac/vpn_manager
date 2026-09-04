@@ -276,14 +276,14 @@ Session name: vpn.example.com
         Path: /net/openvpn/v3/sessions/aa51b41es36b3s438csb18bscd0ba667939d
      Created: 2026-09-03 13:39:10                       PID: 418545
        Owner: isaac                                  Device: tun1
- Config name: /home/isaac/apps/vpns/thinkpad.ovpn
+ Config name: /home/user/vpns/thinkpad.ovpn
 Connected to: udp:66.115.177.199:1194
       Status: Connection, Client connected
 -----------------------------------------------------------------------------
         Path: /net/openvpn/v3/sessions/5bc7ca87t5da4t449dt80cet1df27a1a0b27
      Created: 2026-09-04 11:11:53                       PID: 1027875
        Owner: isaac                                  Device: tun0
- Config name: /home/isaac/apps/vpns/thinkpad.ovpn
+ Config name: /home/user/vpns/thinkpad.ovpn
 Connected to: udp:66.115.177.197:1194
       Status: Connection, Client connected
 -----------------------------------------------------------------------------
@@ -308,7 +308,7 @@ Connected to: udp:66.115.177.197:1194
         };
         assert!(matches_config(
             &session,
-            Path::new("/home/isaac/apps/vpns/thinkpad.ovpn")
+            Path::new("/home/user/vpns/thinkpad.ovpn")
         ));
         assert!(!matches_config(&session, Path::new("/otro/perfil.ovpn")));
         assert!(!matches_config(&Session::default(), Path::new("x.ovpn")));

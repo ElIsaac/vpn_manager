@@ -156,11 +156,11 @@ mod tests {
 
     #[test]
     fn los_argumentos_filtran_ovpn_y_respetan_el_directorio_inicial() {
-        let args = GuiPicker::Zenity.args(Some(Path::new("/home/isaac/apps/vpns")));
+        let args = GuiPicker::Zenity.args(Some(Path::new("/home/user/vpns")));
         assert!(args.iter().any(|a| a == "--file-selection"));
         assert!(args.iter().any(|a| a.contains("*.ovpn")));
         assert!(args.iter().any(|a| a.contains("Todos los archivos")));
-        assert!(args.iter().any(|a| a == "--filename=/home/isaac/apps/vpns/"));
+        assert!(args.iter().any(|a| a == "--filename=/home/user/vpns/"));
 
         // Sin directorio inicial no se inventa uno.
         let args = GuiPicker::Zenity.args(None);
@@ -177,8 +177,8 @@ mod tests {
     #[test]
     fn la_salida_del_dialogo_se_normaliza() {
         assert_eq!(
-            parse_output(true, "/home/isaac/apps/vpns/thinkpad.ovpn\n"),
-            Some(PathBuf::from("/home/isaac/apps/vpns/thinkpad.ovpn"))
+            parse_output(true, "/home/user/vpns/thinkpad.ovpn\n"),
+            Some(PathBuf::from("/home/user/vpns/thinkpad.ovpn"))
         );
         // Algunos devuelven URI.
         assert_eq!(

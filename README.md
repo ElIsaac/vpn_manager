@@ -1,252 +1,215 @@
 # vpn
 
-TUI en Rust para gestionar **OpenVPN3**, **OpenFortiVPN** y **Tailscale** desde
-una sola pantalla, con estado persistido en SQLite. Sucesor de `vpn-tui`
-(que a su vez reemplazaba al `vpn_manager.py` de `../vpns`).
+Un solo gestor en la terminal para tus tres tipos de VPN: **OpenVPN3**,
+**OpenFortiVPN** y **Tailscale**. Conecta, desconecta y ve el estado real, el
+tráfico y el log de cada túnel sin salir de la terminal ni recordar tres
+sintaxis distintas.
 
 ```
-╭ vpn ─────────────────────────────────────────────────╮
-│                                                       │
-│                    1) OpenVPN3                        │
-│                                                       │
-│                    2) OpenFortiVPN                     │
-│                                                       │
-│                    3) Tailscale                        │
-│                                                       │
-╰───────────────────────────────────────────────────────╯
- c  configuración   q  salir
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ vpn   0/4 activas   IPv6 off                                                                     │
+╰──────────────────────────────────────────────────────────────────────────────────────── 16:02:02 ╯
+╭ VPNS ─────────────────────────╮╭ detalle ────────────────────────────╮╭ tráfico ─────────────────╮
+│ ○ OpenVPN3 (trabajo)          ││ tipo  OpenVPN3                      ││↓ rx 0 B/s                │
+│       desconectado            ││ destino                             ││                          │
+│ ○ OpenVPN3 (casa)             ││ /home/user/vpns/trabajo.ovpn        ││                          │
+│       desconectado            ││ estado  desconectado                ││                          │
+│ ○ OpenFortiVPN                ││                                     ││                          │
+│       desconectado            ││                                     ││↑ tx 0 B/s                │
+│ ○ Tailscale                   ││                                     ││                          │
+│       desconectado            ││                                     ││                          │
+│                               ││                                     ││                          │
+│                               │╰─────────────────────────────────────╯╰──────────────────────────╯
+│                               │╭ registro  1 ────────────────────────────────────────────────────╮
+│                               ││16:01:59 base de datos: ~/.local/share/vpn-tui/vpn-tui.db        │
+│                               ││                                                                 │
+╰───────────────────────────────╯│                                                                 │
+╭───────────────────────────────╮│                                                                 │
+│       ⚙  configuración        ││                                                                 │
+╰───────────────────────────────╯╰─────────────────────────────────────────────────────────────────╯
+ ↑↓  mover   ←→  panel   1/2/3  saltar a tipo   enter  conectar/cortar   a  todas   x  cortar todas
 ```
 
-`1`/`2` entran a un dashboard con estado en vivo, tráfico y log por perfil
-(igual que `vpn-tui` original); `3` entra al estado de Tailscale. Todo lo que
-no es "conectar/desconectar el día a día" — agregar o editar perfiles, ajustes
-generales, el toggle de IPv6, ver y matar sesiones OpenVPN3 huérfanas — vive
-en el menú de **configuración** (`c`), no en el menú principal.
+## Por qué
 
-## Características
+Cada cliente hace lo mismo a su manera: `openvpn3` habla por D-Bus y sobrevive
+a que cierres la terminal, `openfortivpn` es un proceso que necesita root y se
+mata con señales, y `tailscale` tiene su propio demonio y su propio modelo de
+permisos. Esta TUI los pone bajo una sola interfaz y, sobre todo, **nunca te
+pide contraseña a media conexión**: los permisos mínimos se conceden una vez al
+instalar.
 
-- **Perfiles en SQLite**, no en un `config.toml` estático: se agregan, editan
-  y borran desde la propia TUI (menú de config → Perfiles).
-- **Alta de OpenVPN3 en dos pasos**, en el orden en que se piensa: primero el
-  archivo (arrastrándolo, con el explorador del sistema en `F2`, con el de la
-  terminal en `F3`, o tecleando la ruta) y solo después el nombre, que es
-  opcional — se sugiere el del archivo y basta `enter` para omitirlo. Deja de
-  serlo en cuanto hay un segundo perfil del mismo tipo, y la pantalla lo avisa
-  ahí mismo.
-- **Arrastrar el `.ovpn` a la ventana funciona**: no hay drag & drop nativo en
-  una terminal, pero al soltar un archivo el emulador pega su ruta, y la zona
-  de importación la entiende venga como venga — cruda, entre comillas, con los
-  espacios escapados o como URI `file://` percent-encoded. Pegar la ruta a mano
-  (`ctrl+shift+v`) hace exactamente lo mismo.
-- **Migración automática, una sola vez**: si ya tenías un `config.toml` de la
-  versión anterior, sus perfiles (incluidas las credenciales de FortiVPN) se
-  importan a la base de datos la primera vez que corres `vpn`. El
-  `config.toml` no se borra ni se vuelve a tocar después de eso.
-- **Tailscale integrado**: estado (`backend`, IPs, exit-node, rutas
-  anunciadas), conectar/desconectar, elegir exit-node de una lista de peers
-  candidatos, y anunciar subnet routes (recordando que el admin del tailnet
-  debe aprobarlas aparte).
-- **Matador de sesiones OpenVPN3**: el menú de config muestra *todas* las
-  sesiones vivas que reporta `openvpn3 sessions-list` — incluidas las que
-  nadie cerró (reconexiones automáticas del core, sesiones de ayer que
-  siguen vivas) — y permite cerrar una o todas.
-- **Toggle de IPv6 real**: lee `/proc/sys/net/ipv6/conf/all/disable_ipv6` en
-  vez de asumir un estado, y alterna entre los dos scripts instalados en
-  `/usr/local/libexec/vpn/` (`ipv6-disable.sh` / `ipv6-enable.sh`).
-- **Ambas VPNs a la vez o por separado**, sin bloquear la interfaz: cada
-  conexión corre en su propio hilo y reporta por un canal.
-- **Adopción de sesiones existentes**: si ya había un túnel levantado (por
-  esta TUI, por el script de Python o a mano), lo detecta y lo muestra. Esas
-  conexiones se marcan como externas y **no** se cierran al salir.
-- **Reconciliación continua**: cada `poll_interval_ms` (2 s por omisión)
-  consulta `openvpn3 sessions-list`, `pgrep openfortivpn`, `tailscale status
-  --json` y `/sys/class/net`, así que el estado que ves es el real.
-- **Credenciales fuera de `ps`**: `openfortivpn` recibe un archivo de
-  configuración temporal `chmod 600` en `$XDG_RUNTIME_DIR`, que se borra al
-  terminar el proceso.
-- **Nunca pide contraseña**: todo lo que necesita root va por `sudo -n`
-  (openfortivpn, los scripts de IPv6) o directo por D-Bus/CLI sin privilegios
-  (openvpn3, tailscale — con reintento por `sudo -n` si el equipo no tiene
-  configurado `tailscale set --operator`).
+## Qué hace
+
+- **Los tres tipos en una sola lista**, con el estado real y no el que la app
+  crea recordar: se reconcilia cada 2 s contra `openvpn3 sessions-list`,
+  `pgrep openfortivpn`, `tailscale status` y `/sys/class/net`.
+- **Adopta sesiones que ya estaban abiertas** —levantadas a mano, por otra
+  herramienta o por una ejecución anterior— y no las cierra al salir.
+- **Log por VPN**: al moverte entre perfiles ves solo el registro de esa
+  conexión, no todo revuelto.
+- **Tráfico en vivo**: totales y velocidad instantánea por perfil.
+- **Matador de sesiones OpenVPN3**: lista *todas* las sesiones vivas del sistema
+  (incluidas las huérfanas que se quedaron reconectando solas) y las corta una
+  por una o todas de golpe.
+- **Alta de perfiles guiada**: arrastra el `.ovpn` a la terminal, ábrelo con el
+  explorador gráfico del sistema, o navégalo dentro de la TUI.
+- **IPv6**: interruptor para deshabilitarlo o habilitarlo, útil con VPNs que
+  dejan escapar tráfico fuera del túnel.
+- **Tailscale completo**: estado, up/down, elegir exit-node y anunciar rutas.
+
+## Requisitos
+
+- Linux con systemd, y Rust (`cargo`) para compilar. Si no lo tienes, el
+  instalador se ofrece a ponerlo con rustup.
+- Los clientes que vayas a usar (`openvpn3`, `openfortivpn`, `tailscale`): el
+  instalador los instala por ti, y solo necesitas los que uses.
+
+Probado de punta a punta en **Fedora, Debian, Ubuntu y Kali**.
+
+> **Sobre `openvpn3` en Debian/Ubuntu**: el repo oficial del proyecto OpenVPN3
+> Linux solo publica paquetes para codenames antiguos (`bullseye`, `jammy`,
+> `focal`), no para `bookworm` ni `noble`. En Kali y en Debian sid/testing sí
+> existe el paquete nativo `openvpn3-client`, y el instalador lo prefiere. Si tu
+> versión no tiene ninguno de los dos, el instalador avisa y sigue: el resto
+> (FortiVPN, Tailscale) funciona igual.
 
 ## Instalación
 
 ```bash
-cd /home/isaac/apps/vpn-tui
+git clone https://github.com/ElIsaac/vpn_manager.git
+cd vpn_manager
 sudo ./install.sh
 ```
 
-Instala en el layout estándar del sistema (por eso necesita `sudo`):
+Layout estándar del sistema:
 
 | Qué | Dónde |
 | --- | --- |
-| binario | `/usr/local/bin/vpn` (root:root 755) |
-| scripts de IPv6 | `/usr/local/libexec/vpn/ipv6-{disable,enable}.sh` (root:root 755) |
-| entrada del lanzador | `/usr/share/applications/vpn.desktop` |
-| reglas sudo | `/etc/sudoers.d/vpn-tui` |
-| datos del usuario | `~/.local/share/vpn-tui/vpn-tui.db` (no se toca al reinstalar) |
+| binario | `/usr/local/bin/vpn` |
+| scripts privilegiados de IPv6 | `/usr/local/libexec/vpn/ipv6-*.sh` (root:root) |
+| lanzador de escritorio | `/usr/local/libexec/vpn/vpn-launcher.sh` |
+| entrada del menú de apps | `/usr/share/applications/vpn.desktop` |
+| ícono | `/usr/share/icons/hicolor/512x512/apps/vpn.png` |
+| tus datos | `~/.local/share/vpn-tui/vpn-tui.db` |
 
-La compilación corre como tu usuario (no como root); solo la instalación de
-archivos es privilegiada. No hace falta tocar el `PATH`: `/usr/local/bin` ya
-está en el de cualquier shell. Con la entrada `.desktop` (`Terminal=true`)
-`vpn` aparece en el lanzador de aplicaciones y se abre en tu terminal
-predeterminada.
+También queda en el lanzador de aplicaciones de tu escritorio: al abrirlo desde
+ahí arranca en tu terminal (respeta `$TERMINAL`; si no, prefiere kitty, ghostty,
+alacritty, foot, wezterm, ptyxis…).
 
-El instalador reconoce Fedora/RHEL-like (`dnf`) y Debian/Ubuntu-like (`apt`):
-
-- `openfortivpn`: paquete oficial en ambos.
-- `openvpn3`: en Fedora viene del COPR de terceros `dsommers/openvpn3`
-  (`dnf copr enable` + `dnf install`); en Debian/Ubuntu, del repo APT oficial
-  del proyecto (`swupdate.openvpn.net`) si publica lista para tu codename —
-  hoy no cubre bookworm/noble; en Kali se usa el paquete nativo
-  `openvpn3-client`. Ver la
-  [wiki de OpenVPN3Linux](https://community.openvpn.net/openvpn/wiki/OpenVPN3Linux).
-- `tailscale`: instalador oficial (`curl -fsSL https://tailscale.com/install.sh | sh`),
-  que ya cubre ambas familias de distro.
-
-Si detecta el alias viejo `alias vpn="python3 .../vpn_manager.py"` en tu
-`~/.zshrc`, lo comenta (no lo borra) y avisa.
-
-O a mano:
+## Uso
 
 ```bash
-cargo build --release
-./target/release/vpn
+vpn            # abre la TUI
+vpn 1          # entra directo a OpenVPN3, y conecta si hay un solo perfil
+vpn 2          # lo mismo para OpenFortiVPN
+vpn 3          # lo mismo para Tailscale
+vpn --status   # una línea por perfil, sin TUI (para barras de estado y scripts)
 ```
 
-Requiere Rust 1.88+, y `openvpn3` / `openfortivpn` / `tailscale` según los
-perfiles y funciones que uses.
-
-## Base de datos
-
-SQLite, buscada en:
-
-1. `$VPN_TUI_DB`
-2. `~/.local/share/vpn-tui/vpn-tui.db` (por omisión)
-
-Se crea sola (con `chmod 600`) la primera vez que corres `vpn`, migrando
-perfiles desde un `config.toml` viejo si lo encuentra (misma búsqueda que
-usaba la versión anterior: `$VPN_TUI_CONFIG`, el directorio del binario,
-`./config.toml`, `~/.config/vpn-tui/config.toml`). El formato de
-`config.toml` sigue documentado en [`config.example.toml`](config.example.toml)
-solo como referencia de qué se migra — ya no es la fuente de verdad en
-ejecución.
-
-## Atajos
-
-### Menú principal
+### Atajos
 
 | Tecla | Acción |
 | --- | --- |
-| `1` / `2` / `3` | entrar a OpenVPN3 / OpenFortiVPN / Tailscale |
-| `c` | menú de configuración |
-| `q` / `esc` / `ctrl-c` | salir |
-
-### Dashboard (OpenVPN3 / OpenFortiVPN)
-
-| Tecla | Acción |
-| --- | --- |
-| `↑` `↓` / `k` `j` | mover selección (o desplazar el log si tiene el foco) |
-| `enter` / `space` | conectar o desconectar el perfil seleccionado |
-| `c` / `d` | conectar / desconectar el perfil |
-| `a` / `x` | conectar / desconectar todos los de este tipo |
-| `tab` | alternar foco entre perfiles y registro |
-| `pgup` `pgdn`, `g`, `G` | desplazar el registro / ir al inicio / seguir el final |
-| `r` | limpiar el registro |
+| `↑` `↓` / `k` `j` | mover la selección (o desplazar el registro si tiene el foco) |
+| `←` `→` | cambiar de panel (VPNS → registro → ⚙ configuración) |
+| `1` `2` `3` | saltar a la primera VPN de ese tipo |
+| `enter` / `space` | conectar o cortar lo seleccionado |
+| `a` / `x` | conectar todas / cortar todas |
+| `6` | interruptor de IPv6 |
+| `esc` | cerrar el modal actual, o salir |
 | `?` | ayuda |
-| `q` / `esc` | volver al menú principal (cierra lo que abrió esta TUI) |
+| `q` / `ctrl-c` | salir |
 
-### Tailscale
+Al salir se cierran solo las conexiones que abrió la TUI; las que ya estaban
+levantadas se quedan intactas.
 
-| Tecla | Acción |
-| --- | --- |
-| `enter` / `space` | conectar / desconectar |
-| `e` | elegir exit-node (lista de peers candidatos) |
-| `r` | editar rutas anunciadas |
-| `esc` / `q` | volver al menú principal |
+### Agregar un perfil
 
-### Config (`c` desde el menú principal)
+Desde `⚙ configuración → perfiles`, o con `enter` sobre una fila
+`… No Configurada`. El alta de OpenVPN3 va en dos pasos:
 
-| Tecla | Acción |
-| --- | --- |
-| `↑` `↓` | moverse en el menú o en una lista |
-| `enter` | entrar / confirmar |
-| `n` / `e` / `x` | nuevo / editar / borrar perfil (en una lista de perfiles) |
-| `F2` | explorador de archivos del sistema (zenity/kdialog/yad) |
-| `F3` | explorador dentro de la terminal (campos de ruta, en el formulario o en General) |
-| arrastrar / `ctrl+shift+v` | soltar o pegar la ruta de un `.ovpn` en la zona de importación |
-| `tab` / `shift-tab` | siguiente / anterior campo |
-| `t` | alternar IPv6 (en la pantalla de estado de IPv6) |
-| `d` / `a` / `esc`/`n` | matar sesión seleccionada / matar todas / cancelar (sesiones OpenVPN3) |
-| `esc` / `q` | atrás |
+1. **El archivo**: arrastra el `.ovpn` sobre la ventana de la terminal (la
+   terminal pega la ruta y la app la interpreta, incluyendo `file://`, comillas
+   y espacios escapados), `F2` para el explorador gráfico del sistema, `F3` para
+   el explorador dentro de la TUI, o teclea la ruta.
+2. **El nombre**: opcional. Sin nombre la fila se ve como `OpenVPN3`; con
+   nombre, `OpenVPN3 (trabajo)`. Solo es obligatorio si ya tienes otro perfil
+   del mismo tipo.
 
-## Modos no interactivos
+## Dónde viven tus datos
+
+En SQLite, en `~/.local/share/vpn-tui/vpn-tui.db` (`chmod 600`): ahí van los
+perfiles y los ajustes.
+
+Para FortiVPN puedes guardar la contraseña en la base de datos o —mejor— dejar
+solo el **nombre de una variable de entorno** y exportarla en tu sesión. Cuando
+sí se usa, nunca viaja por la línea de comandos: se escribe en un archivo
+temporal `chmod 600` dentro de `$XDG_RUNTIME_DIR` que se borra al terminar, para
+que no aparezca en `ps`.
+
+## Permisos: qué se concede y por qué
+
+La TUI usa `sudo -n` (nunca interactivo), así que lo privilegiado se autoriza al
+instalar. Esto queda en `/etc/sudoers.d/vpn-tui`:
+
+```
+<usuario> ALL=(ALL) NOPASSWD: /usr/bin/openfortivpn
+<usuario> ALL=(ALL) NOPASSWD: /usr/bin/pkill -INT  -x openfortivpn
+<usuario> ALL=(ALL) NOPASSWD: /usr/bin/pkill -TERM -x openfortivpn
+<usuario> ALL=(ALL) NOPASSWD: /usr/bin/pkill -KILL -x openfortivpn
+<usuario> ALL=(ALL) NOPASSWD: /usr/local/libexec/vpn/ipv6-disable.sh
+<usuario> ALL=(ALL) NOPASSWD: /usr/local/libexec/vpn/ipv6-enable.sh
+```
+
+Los `pkill` están acotados a una señal y a un nombre exacto de proceso. Los
+scripts de IPv6 se instalan **root:root en `/usr/local/libexec`** precisamente
+porque llevan `NOPASSWD`: si vivieran en tu home, cualquiera con tu cuenta
+podría reescribirlos y ejecutar código como root sin contraseña.
+
+Para Tailscale el instalador configura el
+[modo operator](https://tailscale.com/kb/1080/cli)
+(`tailscale set --operator=<usuario>`), que autoriza a tu usuario a hacer
+`up`/`down`/`set` sin `sudo` y no concede nada fuera de Tailscale.
+
+`openvpn3` no necesita permisos especiales: habla por D-Bus con su propio
+servicio del sistema.
+
+## Desinstalar
 
 ```bash
-vpn --status      # estado de cada perfil, interfaces y Tailscale, una línea por entrada
-vpn --help
-vpn --version
+sudo rm -f /usr/local/bin/vpn \
+           /usr/share/applications/vpn.desktop \
+           /usr/share/icons/hicolor/512x512/apps/vpn.png \
+           /etc/sudoers.d/vpn-tui
+sudo rm -rf /usr/local/libexec/vpn
+rm -rf ~/.local/share/vpn-tui       # tus perfiles (opcional)
+sudo tailscale set --operator=""    # revertir el modo operator (opcional)
 ```
 
-## Permisos sudo
+## Desarrollo
 
-`openfortivpn` necesita root y la TUI usa `sudo -n`, así que las reglas tienen
-que estar en sudoers o la conexión falla al instante. `install.sh` escribe
-`/etc/sudoers.d/vpn-tui` con lo mínimo:
-
+```bash
+cargo test                                        # 48 tests
+cargo build --release
+VPN_TUI_DB=/tmp/prueba.db ./target/release/vpn    # con una base de datos aparte
 ```
-isaac ALL=(ALL) NOPASSWD: /usr/bin/openfortivpn
-isaac ALL=(ALL) NOPASSWD: /usr/bin/pkill -INT -x openfortivpn
-isaac ALL=(ALL) NOPASSWD: /usr/bin/pkill -TERM -x openfortivpn
-isaac ALL=(ALL) NOPASSWD: /usr/bin/pkill -KILL -x openfortivpn
-isaac ALL=(ALL) NOPASSWD: /usr/local/libexec/vpn/ipv6-disable.sh
-isaac ALL=(ALL) NOPASSWD: /usr/local/libexec/vpn/ipv6-enable.sh
-```
-
-Los scripts de IPv6 se instalan en `/usr/local/libexec/vpn/` y son `root:root`
-justamente porque llevan `NOPASSWD`: una regla así apuntando a un archivo
-dentro del home (editable por el usuario) sería una escalada de privilegios
-trivial. Por lo mismo, las rutas de sudoers son fijas y nunca se leen de la
-base de datos.
-
-Las reglas de `pkill` están acotadas a la señal y al nombre exacto del proceso,
-así que no sirven para tocar nada más. La contrapartida es que afectan a *todos*
-los `openfortivpn` del sistema: si algún día corres varios túneles Forti a la
-vez, añade una regla de `kill` por PID — la TUI ya lo intenta como segunda
-opción.
-
-`openvpn3` no necesita sudo: habla por D-Bus con el servicio del sistema.
-`tailscale` tampoco, salvo que este equipo no tenga configurado
-`tailscale set --operator=$USER`, en cuyo caso la TUI reintenta con `sudo -n`.
-
-## Estructura
 
 ```
 src/
-├── main.rs          CLI, arranque del terminal, enrutamiento de pantallas y teclas
-├── app.rs            estado, transiciones, formularios, reconciliación con el sistema
-├── db.rs             persistencia SQLite (perfiles, ajustes) + migración desde config.toml
-├── event.rs          canal de mensajes: teclado, latido y sondeo (incluye Tailscale)
-├── ui.rs             dibujado (ratatui): menú, dashboard, config, tailscale
+├── main.rs        CLI, arranque de la terminal y mapeo de teclas
+├── app.rs         estado, transiciones y reconciliación con el sistema
+├── db.rs          SQLite: perfiles y ajustes
+├── event.rs       canal de mensajes: teclado, latido, sondeo y pegado
+├── filedialog.rs  explorador gráfico del sistema (zenity/kdialog/yad)
+├── ui.rs          dibujado (ratatui)
 └── vpn/
-    ├── mod.rs        ejecución de comandos con timeout, interfaces, formatos
-    ├── openvpn3.rs   session-start / -manage / sessions-list / session-stats / matador de sesiones
-    ├── fortivpn.rs   spawn con credenciales en archivo temporal, señales, pgrep
-    └── tailscale.rs  status --json + debug prefs, up/down, set exit-node/rutas
+    ├── mod.rs        ejecución con timeout, interfaces, formatos
+    ├── openvpn3.rs   session-start / -manage / sessions-list / session-stats
+    ├── fortivpn.rs   credenciales en archivo temporal, señales, pgrep
+    └── tailscale.rs  status --json, up/down, exit-node, rutas
 ```
 
-`cargo test` cubre el parseo de `openvpn3` (incluidas dos sesiones
-simultáneas), la clasificación de líneas de `openfortivpn`, el parseo de
-`tailscale status --json` + `debug prefs`, y la persistencia/migración en
-`db.rs` (perfiles, CRUD, detección del script hermano de habilitar IPv6).
+## Licencia
 
-## Diferencias con la versión anterior (`vpn-tui` / `vpn_manager.py`)
-
-| | `vpn_manager.py` | `vpn-tui` (v1) | `vpn` (esta versión) |
-| --- | --- | --- | --- |
-| Interfaz | menú, una acción a la vez | pantalla completa | menú 1/2/3 + config aparte |
-| Perfiles | uno de cada tipo, en el código | en `config.toml` | en SQLite, editables desde la TUI |
-| Tailscale | no | no | estado, up/down, exit-node, rutas |
-| Sesiones OpenVPN3 huérfanas | invisibles | invisibles | listadas y se pueden matar |
-| IPv6 | solo deshabilitar | solo deshabilitar | alterna en ambas direcciones |
-| Comando | `vpn_manager.py` / alias `vpn` | `vpn-tui` | `vpn` (`vpn 1`/`2`/`3` saltan el menú) |
+MIT — ver [LICENSE](LICENSE).

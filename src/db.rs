@@ -885,9 +885,9 @@ config = "thinkpad.ovpn"
         std::fs::write(&new_enable, "#!/bin/sh\n").unwrap();
 
         let db = Db::open_in_memory().unwrap();
-        db.set_setting("ipv6_disable_script", "/home/isaac/apps/vpns/ipv6_deshabilitar.sh")
+        db.set_setting("ipv6_disable_script", "/home/user/vpns/ipv6_deshabilitar.sh")
             .unwrap();
-        db.set_setting("ipv6_enable_script", "/home/isaac/apps/vpns/habilitar_ipv6.sh")
+        db.set_setting("ipv6_enable_script", "/home/user/vpns/habilitar_ipv6.sh")
             .unwrap();
 
         upgrade_ipv6_script_paths(&db.conn, &new_disable, &new_enable).unwrap();
@@ -917,7 +917,7 @@ config = "thinkpad.ovpn"
         );
 
         let db2 = Db::open_in_memory().unwrap();
-        let legacy = "/home/isaac/apps/vpns/ipv6_deshabilitar.sh";
+        let legacy = "/home/user/vpns/ipv6_deshabilitar.sh";
         db2.set_setting("ipv6_disable_script", legacy).unwrap();
         upgrade_ipv6_script_paths(
             &db2.conn,

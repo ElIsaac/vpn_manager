@@ -2348,7 +2348,7 @@ mod tests {
     /// archivo sobre la ventana; todas estas formas son reales.
     #[test]
     fn normaliza_la_ruta_de_un_archivo_soltado() {
-        let plain = "/home/isaac/apps/vpns/thinkpad.ovpn";
+        let plain = "/home/user/vpns/thinkpad.ovpn";
         assert_eq!(dropped(plain).as_deref(), Some(plain));
         // Casi siempre viene con salto de línea al final (que además enviaría
         // el formulario si se tratara como tecleo normal).
@@ -2356,17 +2356,17 @@ mod tests {
         assert_eq!(dropped("/x/a.ovpn\r\n").as_deref(), Some("/x/a.ovpn"));
         // Comillas cuando la ruta trae espacios.
         assert_eq!(
-            dropped("'/home/isaac/mi carpeta/vpn.ovpn'").as_deref(),
-            Some("/home/isaac/mi carpeta/vpn.ovpn")
+            dropped("'/home/user/mi carpeta/vpn.ovpn'").as_deref(),
+            Some("/home/user/mi carpeta/vpn.ovpn")
         );
         assert_eq!(
-            dropped("\"/home/isaac/mi carpeta/vpn.ovpn\"").as_deref(),
-            Some("/home/isaac/mi carpeta/vpn.ovpn")
+            dropped("\"/home/user/mi carpeta/vpn.ovpn\"").as_deref(),
+            Some("/home/user/mi carpeta/vpn.ovpn")
         );
         // URI file:// (GNOME/Nautilus y varios más).
         assert_eq!(
-            dropped("file:///home/isaac/apps/vpns/thinkpad.ovpn").as_deref(),
-            Some("/home/isaac/apps/vpns/thinkpad.ovpn")
+            dropped("file:///home/user/vpns/thinkpad.ovpn").as_deref(),
+            Some("/home/user/vpns/thinkpad.ovpn")
         );
         assert_eq!(
             dropped("file://localhost/x/a.ovpn").as_deref(),
@@ -2374,13 +2374,13 @@ mod tests {
         );
         // URI con percent-encoding.
         assert_eq!(
-            dropped("file:///home/isaac/mi%20carpeta/vpn.ovpn").as_deref(),
-            Some("/home/isaac/mi carpeta/vpn.ovpn")
+            dropped("file:///home/user/mi%20carpeta/vpn.ovpn").as_deref(),
+            Some("/home/user/mi carpeta/vpn.ovpn")
         );
         // Espacios escapados al estilo shell.
         assert_eq!(
-            dropped("/home/isaac/mi\\ carpeta/vpn.ovpn").as_deref(),
-            Some("/home/isaac/mi carpeta/vpn.ovpn")
+            dropped("/home/user/mi\\ carpeta/vpn.ovpn").as_deref(),
+            Some("/home/user/mi carpeta/vpn.ovpn")
         );
         // Varios archivos soltados a la vez: se toma el primero.
         assert_eq!(
@@ -2573,7 +2573,7 @@ mod tests {
     #[test]
     fn la_sugerencia_de_nombre_sale_del_nombre_del_archivo() {
         assert_eq!(
-            suggested_profile_name(Path::new("/home/isaac/apps/vpns/thinkpad.ovpn")).as_deref(),
+            suggested_profile_name(Path::new("/home/user/vpns/thinkpad.ovpn")).as_deref(),
             Some("thinkpad")
         );
         assert_eq!(suggested_profile_name(Path::new("/")), None);

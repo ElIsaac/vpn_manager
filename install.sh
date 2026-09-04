@@ -229,13 +229,17 @@ install_desktop() {
 }
 
 # --- alias viejo -------------------------------------------------------------
+# Este proyecto nació reemplazando un script `vpn_manager.py` invocado por un
+# alias `vpn`. Si ese alias sigue vivo, le gana al binario recién instalado y el
+# usuario creería que la instalación no sirvió, así que se comenta (no se borra).
 disable_old_alias() {
-  local rc="$TARGET_HOME/.zshrc"
-  local old='alias vpn="python3 /home/isaac/apps/vpns/vpn_manager.py"'
-  [[ -f "$rc" ]] || return 0
-  grep -qF "$old" "$rc" || return 0
-  as_user sed -i "s|^${old}$|# reemplazado por vpn-tui/install.sh — # ${old}|" "$rc"
-  warn "comenté el alias viejo de 'vpn' (vpn_manager.py) en $rc; abre una terminal nueva"
+  local rc
+  for rc in "$TARGET_HOME/.zshrc" "$TARGET_HOME/.bashrc"; do
+    [[ -f "$rc" ]] || continue
+    grep -qE '^[[:space:]]*alias[[:space:]]+vpn=.*vpn_manager\.py' "$rc" || continue
+    as_user sed -i -E 's|^([[:space:]]*alias[[:space:]]+vpn=.*vpn_manager\.py.*)$|# reemplazado por el instalador de vpn — \1|' "$rc"
+    warn "comenté el alias viejo de 'vpn' (vpn_manager.py) en $rc; abre una terminal nueva"
+  done
 }
 
 # --- sudoers ------------------------------------------------------------------
