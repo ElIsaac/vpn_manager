@@ -8,6 +8,7 @@
 # Layout (estándar FHS/XDG para un programa instalado a mano):
 #   /usr/local/bin/vpn                     binario
 #   /usr/local/libexec/vpn/ipv6-*.sh       scripts privilegiados (root:root)
+#   /usr/local/libexec/vpn/vpn-launcher.sh abre la TUI en la terminal del usuario
 #   /usr/share/applications/vpn.desktop    entrada del lanzador
 #   /usr/share/icons/hicolor/512x512/apps/vpn.png   ícono de la app
 #   ~/.local/share/vpn-tui/vpn-tui.db      datos por usuario (no se toca)
@@ -28,6 +29,7 @@ ICON_DIR="$ICON_THEME_DIR/512x512/apps"
 SUDOERS_FILE="/etc/sudoers.d/vpn-tui"
 IPV6_DISABLE="$LIBEXEC_DIR/ipv6-disable.sh"
 IPV6_ENABLE="$LIBEXEC_DIR/ipv6-enable.sh"
+LAUNCHER="$LIBEXEC_DIR/vpn-launcher.sh"
 
 info()  { printf '\033[36m→\033[0m %s\n' "$*"; }
 ok()    { printf '\033[32m✓\033[0m %s\n' "$*"; }
@@ -199,6 +201,11 @@ install_scripts() {
   install -o root -g root -m 755 "$HERE/scripts/ipv6-disable.sh" "$IPV6_DISABLE"
   install -o root -g root -m 755 "$HERE/scripts/ipv6-enable.sh" "$IPV6_ENABLE"
   ok "scripts de IPv6 en $LIBEXEC_DIR (root:root)"
+  # Lanzador para el .desktop: elige la terminal del usuario (kitty y demás) en
+  # vez de dejarlo en manos de `Terminal=true`, que en sesiones sin
+  # xdg-terminal-exec abre cualquier cosa o falla.
+  install -o root -g root -m 755 "$HERE/scripts/vpn-launcher.sh" "$LAUNCHER"
+  ok "lanzador en $LAUNCHER"
 }
 
 install_icon() {
