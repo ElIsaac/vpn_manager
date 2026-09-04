@@ -63,16 +63,49 @@ install_openvpn3_fedora() {
 
 install_openvpn3_debian() {
   command -v openvpn3 >/dev/null && { ok "openvpn3 ya está instalado"; return; }
-  [[ -n "$DISTRO_CODENAME" ]] || die "no pude determinar VERSION_CODENAME de /etc/os-release"
+
+  # Antes de tocar repos de terceros: algunas distros ya lo empaquetan nativo
+  # (Kali `main`, Debian sid/testing) — siempre preferible al repo del vendor.
+  apt-get update -qq
+  if apt-get install -y openvpn3-client 2>/dev/null && command -v openvpn3 >/dev/null; then
+    ok "openvpn3 instalado (paquete nativo de la distro: openvpn3-client)"
+    return
+  fi
+
+  if [[ -z "$DISTRO_CODENAME" ]]; then
+    warn "no pude determinar VERSION_CODENAME de /etc/os-release; omito openvpn3"
+    return
+  fi
+
+  # El repo oficial de OpenVPN3 Linux (swupdate.openvpn.net) NO publica lista
+  # para todos los codenames vigentes — confirmado con pruebas reales: 200 en
+  # bullseye/buster/jammy/focal/lunar, 404 en bookworm/noble/trixie/sid y en
+  # cualquier cosa que no sea un codename de Debian/Ubuntu (p. ej. kali-rolling,
+  # que de todos modos ya se resuelve arriba por el paquete nativo). No se
+  # inventa un codename de reemplazo (mezclar un .deb de otra versión es un
+  # riesgo de compatibilidad, no una garantía) — si no hay lista para el
+  # codename real, se omite con un aviso claro en vez de tronar todo el
+  # instalador.
+  local list_url="https://swupdate.openvpn.net/community/openvpn3/repos/openvpn3-${DISTRO_CODENAME}.list"
+  local http_code
+  http_code="$(curl -fsSL -o /dev/null -w '%{http_code}' "$list_url" 2>/dev/null || true)"
+  if [[ "$http_code" != "200" ]]; then
+    warn "el repo oficial de openvpn3-linux no tiene paquete para '$DISTRO_CODENAME' (HTTP $http_code en $list_url)"
+    warn "omito openvpn3 — instálalo manualmente cuando haya soporte, o desde: https://community.openvpn.net/openvpn/wiki/OpenVPN3Linux"
+    return
+  fi
+
   info "agregando el repo APT oficial de OpenVPN3 Linux ($DISTRO_CODENAME)…"
   local key="/etc/apt/trusted.gpg.d/openvpn-repo-pkg-keyring.gpg"
   curl -fsSL https://swupdate.openvpn.net/repos/openvpn-repo-pkg-key.pub \
     | gpg --dearmor -o "$key"
-  curl -fsSL -o /etc/apt/sources.list.d/openvpn3.list \
-    "https://swupdate.openvpn.net/community/openvpn3/repos/openvpn3-${DISTRO_CODENAME}.list"
+  curl -fsSL -o /etc/apt/sources.list.d/openvpn3.list "$list_url"
   apt-get update -qq
-  apt-get install -y openvpn3
-  ok "openvpn3 instalado (repo oficial swupdate.openvpn.net)"
+  if apt-get install -y openvpn3; then
+    ok "openvpn3 instalado (repo oficial swupdate.openvpn.net)"
+  else
+    warn "el repo de openvpn3 se agregó pero la instalación falló; revisa manualmente"
+  fi
 }
 
 install_openfortivpn() {
@@ -149,7 +182,7 @@ install_bin() {
 # shell directamente. Idempotente: si ya hay una línea con .local/bin, no toca
 # nada.
 append_line_as_user() {
-  as_user bash -c 'printf "%s\n" "$1" >> "$2"' _ "$1" "$2"
+  as_user bash -c 'printf "%s\n" "$1" >> "$2"' _ "$2" "$1"
 }
 
 ensure_bin_on_path() {
@@ -204,8 +237,12 @@ install_sudoers() {
   # existe todavía (primera instalación, antes de correr `vpn` una vez), se
   # cae a la convención de este proyecto: scripts junto a `../vpns/`.
   local disable_script enable_script
-  disable_script="$(ipv6_script_from_db ipv6_disable_script)"
-  enable_script="$(ipv6_script_from_db ipv6_enable_script)"
+  # `$(...)` en una asignación simple SÍ dispara `set -e` si el comando
+  # substituido falla (aunque `ipv6_script_from_db` termine en `return` por
+  # DB inexistente, que es el caso normal en toda instalación nueva) — se
+  # neutraliza con `|| true` para no tronar el instalador por esto.
+  disable_script="$(ipv6_script_from_db ipv6_disable_script || true)"
+  enable_script="$(ipv6_script_from_db ipv6_enable_script || true)"
   [[ -n "$disable_script" ]] || disable_script="$(cd "$HERE/.." && pwd)/vpns/ipv6_deshabilitar.sh"
   [[ -n "$enable_script" ]] || enable_script="$(cd "$HERE/.." && pwd)/vpns/habilitar_ipv6.sh"
 
