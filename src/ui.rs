@@ -9,7 +9,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{App, ConfigScreen, Focus, Kind, Screen, TailscaleScreen};
+use crate::app::{App, ConfigScreen, Focus, Kind, LogEntry, Screen, TailscaleScreen};
 use crate::event::Level;
 use crate::vpn::{human_bytes, human_duration, State};
 
@@ -23,8 +23,7 @@ const DETAIL_HEIGHT: u16 = 11;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.screen {
-        Screen::MainMenu => draw_main_menu(frame, app),
-        Screen::Dashboard(kind) => draw_dashboard(frame, app, kind),
+        Screen::Dashboard => draw_dashboard(frame, app),
         Screen::Tailscale(screen) => draw_tailscale(frame, app, screen),
         Screen::Config(screen) => draw_config(frame, app, screen),
     }
@@ -34,61 +33,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
-// ---------------------------------------------------------------- main menu
-
-fn draw_main_menu(frame: &mut Frame, app: &App) {
-    let [area, footer] =
-        Layout::vertical([Constraint::Min(6), Constraint::Length(1)]).areas(frame.area());
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ACCENT))
-        .title(Span::styled(" vpn ", Style::new().fg(ACCENT).bold()));
-    frame.render_widget(&block, area);
-
-    let mut lines = vec![
-        Line::from(""),
-        menu_item("1", "OpenVPN3", app.openvpn_available),
-        Line::from(""),
-        menu_item("2", "OpenFortiVPN", app.fortivpn_available),
-        Line::from(""),
-        menu_item("3", "Tailscale", app.tailscale_available),
-    ];
-    if let Some((level, text)) = app.active_toast() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(format!("  {text}"), level_style(level))));
-    }
-
-    let width = 40u16.min(area.width.saturating_sub(4));
-    let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(4));
-    let popup = center(block.inner(area), width, height);
-    frame.render_widget(Paragraph::new(lines), popup);
-
-    let spans = vec![
-        Span::styled(" c ", Style::new().fg(Color::Black).bg(MUTED)),
-        Span::styled(" configuración  ", Style::new().fg(MUTED)),
-        Span::styled(" q ", Style::new().fg(Color::Black).bg(MUTED)),
-        Span::styled(" salir", Style::new().fg(MUTED)),
-    ];
-    frame.render_widget(Paragraph::new(Line::from(spans)), footer);
-}
-
-fn menu_item(key: &str, label: &str, available: bool) -> Line<'static> {
-    let mut spans = vec![
-        Span::raw("   "),
-        Span::styled(format!("{key}) "), Style::new().fg(ACCENT).bold()),
-        Span::styled(label.to_string(), Style::new().fg(Color::White).bold()),
-    ];
-    if !available {
-        spans.push(Span::styled("  (no instalado)", Style::new().fg(Color::Red)));
-    }
-    Line::from(spans)
-}
-
 // ----------------------------------------------------------------- dashboard
 
-fn draw_dashboard(frame: &mut Frame, app: &mut App, kind: Kind) {
+fn draw_dashboard(frame: &mut Frame, app: &mut App) {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(6),
@@ -96,7 +43,7 @@ fn draw_dashboard(frame: &mut Frame, app: &mut App, kind: Kind) {
     ])
     .areas(frame.area());
 
-    draw_header(frame, app, header, kind);
+    draw_header(frame, app, header);
 
     let sidebar = sidebar_width(body.width);
     let [left, right] =
@@ -123,7 +70,7 @@ fn sidebar_width(total: u16) -> u16 {
         .min(total.saturating_sub(20).max(22))
 }
 
-fn draw_header(frame: &mut Frame, app: &App, area: Rect, kind: Kind) {
+fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let (up, total) = app.summary();
     let status_color = if up == 0 {
         MUTED
@@ -134,7 +81,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, kind: Kind) {
     };
 
     let mut spans = vec![
-        Span::styled(" VPN ", Style::new().fg(Color::Black).bg(ACCENT).bold()),
+        Span::styled(" VPNS ", Style::new().fg(Color::Black).bg(ACCENT).bold()),
         Span::raw("  "),
         Span::styled(
             format!("{up}/{total} activas"),
@@ -148,13 +95,19 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, kind: Kind) {
         None => {}
     }
 
-    let unavailable = match kind {
-        Kind::OpenVpn => !app.openvpn_available,
-        Kind::Forti => !app.fortivpn_available,
-    };
-    if unavailable {
+    let mut missing: Vec<&str> = Vec::new();
+    if !app.openvpn_profiles.is_empty() && !app.openvpn_available {
+        missing.push("openvpn3");
+    }
+    if !app.forti_profiles.is_empty() && !app.fortivpn_available {
+        missing.push("openfortivpn");
+    }
+    if !app.tailscale_available {
+        missing.push("tailscale");
+    }
+    if !missing.is_empty() {
         spans.push(Span::styled(
-            format!("   ⚠ {} ausente", if kind == Kind::OpenVpn { "openvpn3" } else { "openfortivpn" }),
+            format!("   ⚠ falta: {}", missing.join(", ")),
             Style::new().fg(Color::Red),
         ));
     }
@@ -174,7 +127,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, kind: Kind) {
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(MUTED))
         .title(Line::from(vec![Span::styled(
-            format!(" {} ", kind.label()),
+            " VPNS ",
             Style::new().fg(ACCENT).bold(),
         )]))
         .title_bottom(
@@ -222,7 +175,7 @@ fn draw_profiles(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    let block = panel("perfiles", focused).padding(Padding::new(1, 1, 0, 0));
+    let block = panel("VPNS", focused).padding(Padding::new(1, 1, 0, 0));
     let list = List::new(items).block(block).highlight_style(
         Style::new()
             .bg(if focused {
@@ -272,33 +225,60 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
         ),
     ];
 
-    if let Some(session) = &p.session_path {
-        lines.push(field(
-            "sesión",
-            Span::styled(short_session(session), Style::new().fg(MUTED)),
-        ));
-    }
-    if let Some(pid) = p.pid {
-        lines.push(field(
-            "pid",
-            Span::styled(pid.to_string(), Style::new().fg(MUTED)),
-        ));
-    }
-    if p.device.is_some() || p.addr.is_some() {
-        let dev = p.device.clone().unwrap_or_else(|| "-".into());
-        let addr = p.addr.clone().unwrap_or_else(|| "-".into());
-        lines.push(field("interfaz", Span::raw(format!("{dev}  {addr}"))));
-    }
-    if p.state.is_up() {
-        lines.push(field(
-            "total",
-            Span::raw(format!(
-                "↓ {}   ↑ {}",
-                human_bytes(p.stats.bytes_in),
-                human_bytes(p.stats.bytes_out)
-            )),
-        ));
-        lines.push(field("velocidad", Span::raw(p.rate_summary())));
+    if p.kind == Kind::Tailscale {
+        if let Some(status) = &app.tailscale_status {
+            lines.push(field(
+                "exit-node",
+                Span::raw(status.exit_node_ip.clone().unwrap_or_else(|| "ninguno".into())),
+            ));
+            lines.push(field(
+                "rutas anunciadas",
+                Span::raw(if status.advertise_routes.is_empty() {
+                    "ninguna".to_string()
+                } else {
+                    status.advertise_routes.join(", ")
+                }),
+            ));
+            if !status.advertise_routes.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  recuerda: el admin del tailnet debe aprobar las rutas anunciadas",
+                    Style::new().fg(Color::Yellow),
+                )));
+            }
+        }
+        lines.push(Line::from(Span::styled(
+            "  'e' exit-node   'R' rutas anunciadas",
+            Style::new().fg(MUTED),
+        )));
+    } else {
+        if let Some(session) = &p.session_path {
+            lines.push(field(
+                "sesión",
+                Span::styled(short_session(session), Style::new().fg(MUTED)),
+            ));
+        }
+        if let Some(pid) = p.pid {
+            lines.push(field(
+                "pid",
+                Span::styled(pid.to_string(), Style::new().fg(MUTED)),
+            ));
+        }
+        if p.device.is_some() || p.addr.is_some() {
+            let dev = p.device.clone().unwrap_or_else(|| "-".into());
+            let addr = p.addr.clone().unwrap_or_else(|| "-".into());
+            lines.push(field("interfaz", Span::raw(format!("{dev}  {addr}"))));
+        }
+        if p.state.is_up() {
+            lines.push(field(
+                "total",
+                Span::raw(format!(
+                    "↓ {}   ↑ {}",
+                    human_bytes(p.stats.bytes_in),
+                    human_bytes(p.stats.bytes_out)
+                )),
+            ));
+            lines.push(field("velocidad", Span::raw(p.rate_summary())));
+        }
     }
     if p.adopted {
         lines.push(Line::from(Span::styled(
@@ -369,12 +349,22 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Logs;
     let viewport = area.height.saturating_sub(2) as usize;
     app.log_viewport = viewport;
-    let total = app.logs.len();
+
+    // Cada perfil ve solo su propio registro; las entradas sin perfil (avisos
+    // globales: guardar config, script de IPv6, arranque…) se muestran
+    // siempre, sin importar la selección.
+    let selected_name = app.selected_profile().map(|p| p.name.clone());
+    let filtered: Vec<&LogEntry> = app
+        .logs
+        .iter()
+        .filter(|e| e.profile.is_none() || e.profile == selected_name)
+        .collect();
+
+    let total = filtered.len();
     let max_offset = total.saturating_sub(viewport);
     let offset = app.log_scroll.unwrap_or(max_offset).min(max_offset);
 
-    let lines: Vec<Line> = app
-        .logs
+    let lines: Vec<Line> = filtered
         .iter()
         .skip(offset)
         .take(viewport.max(1))
@@ -419,12 +409,14 @@ fn draw_dashboard_footer(frame: &mut Frame, app: &App, area: Rect) {
 
     let keys = [
         ("↑↓/jk", "mover"),
+        ("1/2/3", "saltar a tipo"),
         ("enter", "conectar/cortar"),
         ("a", "todas"),
         ("x", "cortar todas"),
         ("tab", "panel"),
+        ("F2", "config"),
         ("?", "ayuda"),
-        ("esc/q", "menú"),
+        ("esc/q", "salir"),
     ];
     render_key_hints(frame, area, &keys);
 }
@@ -442,19 +434,22 @@ fn render_key_hints(frame: &mut Frame, area: Rect, keys: &[(&str, &str)]) {
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let rows: [(&str, &str); 13] = [
-        ("1 / 2 / 3", "OpenVPN3 / OpenFortiVPN / Tailscale"),
-        ("c", "menú de configuración"),
+    let rows: [(&str, &str); 16] = [
+        ("1 / 2 / 3", "saltar selección a OpenVPN3 / OpenFortiVPN / Tailscale"),
+        ("F2", "menú de configuración"),
+        ("? / F1", "abrir o cerrar esta ayuda"),
         ("↑ / k, ↓ / j", "moverse en listas"),
         ("enter / space", "conectar, desconectar, confirmar"),
-        ("a", "conectar todos (en el panel de perfiles)"),
-        ("x", "desconectar todos (en el panel de perfiles)"),
+        ("c / d", "conectar / desconectar el seleccionado"),
+        ("a", "conectar todos"),
+        ("x", "desconectar todos"),
+        ("e", "exit-node de Tailscale (con Tailscale seleccionado)"),
+        ("R", "rutas anunciadas de Tailscale (con Tailscale seleccionado)"),
         ("n / e / x", "nuevo / editar / borrar perfil (listas de config)"),
         ("F3", "buscar archivo (campos de ruta)"),
         ("tab / shift-tab", "siguiente / anterior campo o panel"),
         ("pgup / pgdn, g / G", "desplazar el registro"),
         ("r", "limpiar el registro"),
-        ("?", "abrir o cerrar esta ayuda"),
         ("q / esc / ctrl-c", "atrás / salir"),
     ];
 
@@ -500,18 +495,11 @@ fn draw_tailscale(frame: &mut Frame, app: &App, screen: TailscaleScreen) {
     frame.render_widget(Paragraph::new("").block(title), header);
 
     match screen {
-        TailscaleScreen::Status => draw_tailscale_status(frame, app, body),
         TailscaleScreen::ExitNodePicker => draw_exit_node_picker(frame, app, body),
         TailscaleScreen::RoutesForm => draw_routes_form(frame, app, body),
     }
 
     let keys: &[(&str, &str)] = match screen {
-        TailscaleScreen::Status => &[
-            ("enter", "conectar/desconectar"),
-            ("e", "exit-node"),
-            ("r", "rutas anunciadas"),
-            ("esc/q", "menú"),
-        ],
         TailscaleScreen::ExitNodePicker => &[
             ("↑↓", "mover"),
             ("enter", "elegir"),
@@ -521,51 +509,6 @@ fn draw_tailscale(frame: &mut Frame, app: &App, screen: TailscaleScreen) {
         TailscaleScreen::RoutesForm => &[("enter", "guardar"), ("esc", "cancelar")],
     };
     render_key_hints(frame, footer, keys);
-}
-
-fn draw_tailscale_status(frame: &mut Frame, app: &App, area: Rect) {
-    let block = panel("estado", false).padding(Padding::new(1, 1, 0, 0));
-
-    if !app.tailscale_available {
-        frame.render_widget(
-            Paragraph::new("`tailscale` no está instalado").block(block),
-            area,
-        );
-        return;
-    }
-    let Some(status) = &app.tailscale_status else {
-        frame.render_widget(Paragraph::new("consultando estado…").block(block), area);
-        return;
-    };
-
-    let state_color = if status.is_running() { Color::Green } else { MUTED };
-    let mut lines = vec![
-        field(
-            "backend",
-            Span::styled(status.backend_state.clone(), Style::new().fg(state_color).bold()),
-        ),
-        field("IPs", Span::raw(status.self_ips.join(", "))),
-        field(
-            "exit-node",
-            Span::raw(status.exit_node_ip.clone().unwrap_or_else(|| "ninguno".into())),
-        ),
-        field(
-            "rutas anunciadas",
-            Span::raw(if status.advertise_routes.is_empty() {
-                "ninguna".to_string()
-            } else {
-                status.advertise_routes.join(", ")
-            }),
-        ),
-    ];
-    if !status.advertise_routes.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  recuerda: el admin del tailnet debe aprobar las rutas anunciadas",
-            Style::new().fg(Color::Yellow),
-        )));
-    }
-
-    frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: true }), area);
 }
 
 fn draw_exit_node_picker(frame: &mut Frame, app: &App, area: Rect) {
@@ -679,6 +622,8 @@ fn draw_profile_list(frame: &mut Frame, app: &App, kind: Kind) {
             .iter()
             .map(|p| ListItem::new(format!("  {}  {}@{}", p.name, p.username, p.host)))
             .collect(),
+        // El menú de config nunca abre esta pantalla con Kind::Tailscale.
+        Kind::Tailscale => Vec::new(),
     };
     let title = format!("perfiles {}", kind.label());
     let block = panel(&title, true);

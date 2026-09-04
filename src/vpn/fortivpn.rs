@@ -79,11 +79,23 @@ pub fn signal(pid: u32, sig: &str) -> Result<String> {
     ];
 
     let mut last = String::from("sin intentos");
+    let mut missing_sudoers = false;
     for (label, program, args) in attempts {
         match run_checked(program, &args, Duration::from_secs(10)) {
             Ok(_) => return Ok(format!("{label} -{sig}")),
-            Err(err) => last = format!("{label}: {err}"),
+            Err(err) => {
+                if err.to_string().to_ascii_lowercase().contains("password is required") {
+                    missing_sudoers = true;
+                }
+                last = format!("{label}: {err}");
+            }
         }
+    }
+    if missing_sudoers {
+        bail!(
+            "faltan permisos de sudo para openfortivpn — corre 'sudo ./install.sh' \
+             en el proyecto para instalarlos (último intento: {last})"
+        );
     }
     bail!("no pude enviar SIG{sig} al PID {pid} ({last})")
 }

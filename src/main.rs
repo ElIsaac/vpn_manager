@@ -25,10 +25,10 @@ vpn — gestor TUI de OpenVPN3, OpenFortiVPN y Tailscale
 USO:
     vpn [1|2|3] [OPCIONES]
 
-    (sin argumentos)   menú principal: 1) OpenVPN3  2) OpenFortiVPN  3) Tailscale
-    vpn 1              salta el menú, entra directo a OpenVPN3 (conecta si hay 1 perfil)
-    vpn 2              salta el menú, entra directo a OpenFortiVPN (conecta si hay 1 perfil)
-    vpn 3              salta el menú, entra directo a Tailscale (conecta si no está arriba)
+    (sin argumentos)   panel VPNS con los tres tipos
+    vpn 1              selecciona OpenVPN3 (conecta si hay 1 perfil)
+    vpn 2              selecciona OpenFortiVPN (conecta si hay 1 perfil)
+    vpn 3              selecciona Tailscale (conecta si no está arriba)
 
 OPCIONES:
         --status      Imprime el estado y sale (sin TUI)
@@ -41,11 +41,10 @@ BASE DE DATOS:
     perfiles desde un config.toml viejo si lo encuentra.
 ";
 
-/// A qué pantalla saltar al arrancar (`vpn 1`/`vpn 2`/`vpn 3`), saltando el
-/// menú principal por completo.
+/// Selección inicial (`vpn 1`/`vpn 2`/`vpn 3`) dentro del panel VPNS único.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartupTarget {
-    MainMenu,
+    Default,
     OpenVpn,
     Forti,
     Tailscale,
@@ -57,7 +56,7 @@ enum Mode {
 }
 
 fn main() -> Result<()> {
-    let mut mode = Mode::Tui(StartupTarget::MainMenu);
+    let mut mode = Mode::Tui(StartupTarget::Default);
 
     let args = std::env::args().skip(1);
     for arg in args {
@@ -133,21 +132,21 @@ fn run_tui(db: Db, target: StartupTarget) -> Result<()> {
     let events = Events::start(poll_interval);
     let mut app = App::new(db, events.tx.clone());
 
-    // `vpn 1`/`vpn 2`/`vpn 3` saltan el menú principal directo a la pantalla
-    // correspondiente, y disparan la conexión de inmediato cuando es
-    // inequívoco (un solo perfil de ese tipo, o Tailscale si no está arriba).
+    // `vpn 1`/`vpn 2`/`vpn 3` seleccionan de inmediato esa fila en el panel
+    // VPNS único y disparan la conexión cuando es inequívoco (un solo perfil
+    // de ese tipo, o Tailscale si no está arriba).
     match target {
-        StartupTarget::MainMenu => {}
+        StartupTarget::Default => {}
         StartupTarget::OpenVpn => {
-            app.enter_dashboard(Kind::OpenVpn);
+            app.select_kind(Kind::OpenVpn);
             app.autoconnect_single(Kind::OpenVpn);
         }
         StartupTarget::Forti => {
-            app.enter_dashboard(Kind::Forti);
+            app.select_kind(Kind::Forti);
             app.autoconnect_single(Kind::Forti);
         }
         StartupTarget::Tailscale => {
-            app.enter_tailscale();
+            app.select_kind(Kind::Tailscale);
             app.tailscale_autoconnect();
         }
     }
@@ -217,30 +216,22 @@ fn on_key(app: &mut App, key: KeyEvent) {
     }
 
     match app.screen {
-        Screen::MainMenu => on_key_main_menu(app, key),
-        Screen::Dashboard(kind) => on_key_dashboard(app, key, kind),
+        Screen::Dashboard => on_key_dashboard(app, key),
         Screen::Tailscale(screen) => on_key_tailscale(app, key, screen),
         Screen::Config(screen) => on_key_config(app, key, screen),
     }
 }
 
-fn on_key_main_menu(app: &mut App, key: KeyEvent) {
+fn on_key_dashboard(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Char('1') => app.enter_dashboard(Kind::OpenVpn),
-        KeyCode::Char('2') => app.enter_dashboard(Kind::Forti),
-        KeyCode::Char('3') => app.enter_tailscale(),
-        KeyCode::Char('c') => app.enter_config_menu(),
-        KeyCode::Char('?') | KeyCode::F(1) => app.show_help = true,
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-        _ => {}
-    }
-}
-
-fn on_key_dashboard(app: &mut App, key: KeyEvent, kind: Kind) {
-    match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => app.back_to_main_menu(),
         KeyCode::Char('?') | KeyCode::F(1) => app.show_help = true,
+        KeyCode::F(2) => app.enter_config_menu(),
         KeyCode::Tab | KeyCode::BackTab => app.toggle_focus(),
+
+        KeyCode::Char('1') => app.select_kind(Kind::OpenVpn),
+        KeyCode::Char('2') => app.select_kind(Kind::Forti),
+        KeyCode::Char('3') => app.select_kind(Kind::Tailscale),
 
         KeyCode::Up | KeyCode::Char('k') => match app.focus {
             Focus::Profiles => app.select_prev(),
@@ -266,8 +257,17 @@ fn on_key_dashboard(app: &mut App, key: KeyEvent, kind: Kind) {
                 app.disconnect(idx);
             }
         }
-        KeyCode::Char('a') => app.connect_all(Some(kind)),
-        KeyCode::Char('x') => app.disconnect_all(Some(kind)),
+        KeyCode::Char('a') => app.connect_all(),
+        KeyCode::Char('x') => app.disconnect_all(),
+
+        KeyCode::Char('e') => match app.selected_profile().map(|p| p.kind) {
+            Some(Kind::Tailscale) => app.enter_exit_node_picker(),
+            _ => app.toast(Level::Warn, "'e' solo aplica con Tailscale seleccionado"),
+        },
+        KeyCode::Char('R') => match app.selected_profile().map(|p| p.kind) {
+            Some(Kind::Tailscale) => app.enter_routes_form(),
+            _ => app.toast(Level::Warn, "'R' solo aplica con Tailscale seleccionado"),
+        },
 
         KeyCode::Char('r') => {
             app.logs.clear();
@@ -284,24 +284,6 @@ fn on_key_dashboard(app: &mut App, key: KeyEvent, kind: Kind) {
 
 fn on_key_tailscale(app: &mut App, key: KeyEvent, screen: TailscaleScreen) {
     match screen {
-        TailscaleScreen::Status => match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => app.back_to_main_menu(),
-            KeyCode::Enter | KeyCode::Char(' ') => app.tailscale_toggle(),
-            KeyCode::Char('e') => {
-                app.exit_node_selected = 0;
-                app.screen = Screen::Tailscale(TailscaleScreen::ExitNodePicker);
-            }
-            KeyCode::Char('r') => {
-                let current = app
-                    .tailscale_status
-                    .as_ref()
-                    .map(|s| s.advertise_routes.join(","))
-                    .unwrap_or_default();
-                app.routes_input = tui_input::Input::new(current);
-                app.screen = Screen::Tailscale(TailscaleScreen::RoutesForm);
-            }
-            _ => {}
-        },
         TailscaleScreen::ExitNodePicker => {
             let n = app
                 .tailscale_status
@@ -309,7 +291,7 @@ fn on_key_tailscale(app: &mut App, key: KeyEvent, screen: TailscaleScreen) {
                 .map(|s| s.exit_node_candidates.len())
                 .unwrap_or(0);
             match key.code {
-                KeyCode::Esc => app.screen = Screen::Tailscale(TailscaleScreen::Status),
+                KeyCode::Esc => app.screen = Screen::Dashboard,
                 KeyCode::Up | KeyCode::Char('k')
                     if n > 0 => {
                         app.exit_node_selected = (app.exit_node_selected + n - 1) % n;
@@ -320,7 +302,7 @@ fn on_key_tailscale(app: &mut App, key: KeyEvent, screen: TailscaleScreen) {
                     }
                 KeyCode::Char('c') => {
                     app.tailscale_apply_exit_node(None);
-                    app.screen = Screen::Tailscale(TailscaleScreen::Status);
+                    app.screen = Screen::Dashboard;
                 }
                 KeyCode::Enter => {
                     let ip = app
@@ -331,13 +313,13 @@ fn on_key_tailscale(app: &mut App, key: KeyEvent, screen: TailscaleScreen) {
                     if let Some(ip) = ip {
                         app.tailscale_apply_exit_node(Some(ip));
                     }
-                    app.screen = Screen::Tailscale(TailscaleScreen::Status);
+                    app.screen = Screen::Dashboard;
                 }
                 _ => {}
             }
         }
         TailscaleScreen::RoutesForm => match key.code {
-            KeyCode::Esc => app.screen = Screen::Tailscale(TailscaleScreen::Status),
+            KeyCode::Esc => app.screen = Screen::Dashboard,
             KeyCode::Enter => app.tailscale_apply_routes(),
             _ => {
                 let event = TermEvent::Key(key);
@@ -369,7 +351,7 @@ const CONFIG_MENU_LEN: usize = 5;
 
 fn on_key_config_menu(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => app.back_to_main_menu(),
+        KeyCode::Char('q') | KeyCode::Esc => app.back_to_dashboard(),
         KeyCode::Up | KeyCode::Char('k') => {
             app.config_menu_selected = (app.config_menu_selected + CONFIG_MENU_LEN - 1) % CONFIG_MENU_LEN;
         }
@@ -398,6 +380,7 @@ fn on_key_profile_list(app: &mut App, key: KeyEvent, kind: Kind) {
     let len = match kind {
         Kind::OpenVpn => app.openvpn_profiles.len(),
         Kind::Forti => app.forti_profiles.len(),
+        Kind::Tailscale => 0,
     };
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.enter_config_menu(),

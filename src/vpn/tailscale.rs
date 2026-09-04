@@ -156,6 +156,12 @@ pub fn set_advertise_routes(routes: &[String]) -> Result<()> {
 /// Corre `tailscale <args>`; si falla por falta de privilegios (según cómo
 /// esté configurado `--operator` en este equipo), reintenta con `sudo -n`
 /// para no dejar la TUI colgada pidiendo una contraseña.
+///
+/// Cuando ni el comando normal ni el `sudo -n` de respaldo funcionan (típico
+/// en un equipo donde nunca se configuró `--operator` ni hay sudoers para
+/// `tailscale`), el error de sudo por sí solo ("a password is required") no
+/// deja claro qué hacer — así que aquí se antepone la solución de una sola
+/// vez: `sudo tailscale set --operator=<usuario>`.
 fn run_privileged(args: &[&str]) -> Result<()> {
     if !is_available() {
         bail!("`{BIN}` no está instalado");
@@ -167,14 +173,17 @@ fn run_privileged(args: &[&str]) -> Result<()> {
             let needs_privilege = ["permission", "access denied", "must be root", "operator"]
                 .iter()
                 .any(|kw| msg.contains(kw));
-            if needs_privilege {
-                let mut sudo_args = vec!["-n", BIN];
-                sudo_args.extend_from_slice(args);
-                run_checked("sudo", &sudo_args, Duration::from_secs(20))?;
-                Ok(())
-            } else {
-                Err(err)
+            if !needs_privilege {
+                return Err(err);
             }
+            let mut sudo_args = vec!["-n", BIN];
+            sudo_args.extend_from_slice(args);
+            run_checked("sudo", &sudo_args, Duration::from_secs(20)).map(|_| ()).map_err(|_| {
+                let user = std::env::var("USER").unwrap_or_else(|_| "tu_usuario".to_string());
+                anyhow::anyhow!(
+                    "{err} — corre 'sudo tailscale set --operator={user}' una vez para no necesitar sudo"
+                )
+            })
         }
     }
 }

@@ -21,6 +21,7 @@ const TOAST_TTL: Duration = Duration::from_secs(6);
 pub enum Kind {
     OpenVpn,
     Forti,
+    Tailscale,
 }
 
 impl Kind {
@@ -28,23 +29,24 @@ impl Kind {
         match self {
             Kind::OpenVpn => "OpenVPN3",
             Kind::Forti => "OpenFortiVPN",
+            Kind::Tailscale => "Tailscale",
         }
     }
 }
 
-/// Pantalla visible. `MainMenu` es la entrada: solo "1) OpenVPN3 2)
-/// OpenFortiVPN 3) Tailscale" — todo lo demás vive en `Config`.
+/// Pantalla visible. `Dashboard` es la entrada: un solo panel "VPNS" con los
+/// tres tipos mezclados (perfiles OpenVPN3 + FortiVPN + la fila única de
+/// Tailscale) — todo lo demás vive en `Config`, o en `Tailscale` para las dos
+/// subpantallas propias de exit-node/rutas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
-    MainMenu,
-    Dashboard(Kind),
+    Dashboard,
     Tailscale(TailscaleScreen),
     Config(ConfigScreen),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TailscaleScreen {
-    Status,
     ExitNodePicker,
     RoutesForm,
 }
@@ -391,7 +393,7 @@ impl App {
             general,
             openvpn_profiles,
             forti_profiles,
-            screen: Screen::MainMenu,
+            screen: Screen::Dashboard,
             profiles,
             selected: 0,
             logs: VecDeque::new(),
@@ -458,18 +460,19 @@ impl App {
 
     // ------------------------------------------------------------- navegación
 
-    /// Índices de `self.profiles` visibles en el `Dashboard` actual (filtrado
-    /// por tipo); fuera de un `Dashboard`, todos.
+    /// Índices de `self.profiles` visibles — el panel "VPNS" siempre muestra
+    /// los tres tipos mezclados, así que esto es simplemente todos.
     pub fn visible_profile_indices(&self) -> Vec<usize> {
-        match self.screen {
-            Screen::Dashboard(kind) => self
-                .profiles
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| p.kind == kind)
-                .map(|(i, _)| i)
-                .collect(),
-            _ => (0..self.profiles.len()).collect(),
+        (0..self.profiles.len()).collect()
+    }
+
+    /// Mueve la selección al primer perfil de `kind` (o a la fila de
+    /// Tailscale). Usado por los atajos de teclado `1`/`2`/`3` y por
+    /// `vpn 1`/`vpn 2`/`vpn 3` para saltar directo a un tipo sin tocar la
+    /// navegación normal de flechas.
+    pub fn select_kind(&mut self, kind: Kind) {
+        if let Some(pos) = self.profiles.iter().position(|p| p.kind == kind) {
+            self.selected = pos;
         }
     }
 
@@ -521,27 +524,36 @@ impl App {
 
     // ----------------------------------------------------------------- menús
 
-    pub fn enter_dashboard(&mut self, kind: Kind) {
-        self.screen = Screen::Dashboard(kind);
-        self.selected = 0;
-        self.focus = Focus::Profiles;
-    }
-
-    pub fn enter_tailscale(&mut self) {
-        self.screen = Screen::Tailscale(TailscaleScreen::Status);
-    }
-
     pub fn enter_config_menu(&mut self) {
         self.screen = Screen::Config(ConfigScreen::Menu);
         self.config_menu_selected = 0;
     }
 
-    pub fn back_to_main_menu(&mut self) {
-        self.screen = Screen::MainMenu;
+    pub fn back_to_dashboard(&mut self) {
+        self.screen = Screen::Dashboard;
         self.profile_form = None;
         self.general_form = None;
         self.file_explorer = None;
         self.file_target = None;
+    }
+
+    /// Abre el selector de exit-node de Tailscale (tecla `e` con la fila de
+    /// Tailscale seleccionada en el dashboard).
+    pub fn enter_exit_node_picker(&mut self) {
+        self.exit_node_selected = 0;
+        self.screen = Screen::Tailscale(TailscaleScreen::ExitNodePicker);
+    }
+
+    /// Abre el formulario de rutas anunciadas de Tailscale (tecla `R` con la
+    /// fila de Tailscale seleccionada en el dashboard).
+    pub fn enter_routes_form(&mut self) {
+        let current = self
+            .tailscale_status
+            .as_ref()
+            .map(|s| s.advertise_routes.join(","))
+            .unwrap_or_default();
+        self.routes_input = Input::new(current);
+        self.screen = Screen::Tailscale(TailscaleScreen::RoutesForm);
     }
 
     /// Si hay exactamente un perfil de `kind`, lo conecta de inmediato — usado
@@ -576,6 +588,7 @@ impl App {
         self.profile_form = Some(match kind {
             Kind::OpenVpn => ProfileForm::new_openvpn(None),
             Kind::Forti => ProfileForm::new_forti(None),
+            Kind::Tailscale => unreachable!("Tailscale no tiene ProfileForm"),
         });
         self.screen = Screen::Config(ConfigScreen::ProfileForm);
     }
@@ -590,6 +603,9 @@ impl App {
                 .forti_profiles
                 .get(list_idx)
                 .map(|p| ProfileForm::new_forti(Some(p))),
+            // Tailscale no tiene "perfiles": el menú de config nunca llama
+            // aquí con este `Kind`.
+            Kind::Tailscale => None,
         };
         if let Some(form) = form {
             self.profile_form = Some(form);
@@ -607,6 +623,7 @@ impl App {
                 .forti_profiles
                 .get(list_idx)
                 .map(|p| self.db.delete_forti_profile(p.id)),
+            Kind::Tailscale => None,
         };
         match result {
             Some(Ok(())) => {
@@ -692,6 +709,8 @@ impl App {
                         .map(|_| ()),
                 }
             }
+            // El formulario de perfiles solo se abre para OpenVpn/Forti.
+            Kind::Tailscale => unreachable!("Tailscale no tiene ProfileForm"),
         };
 
         match result {
@@ -880,6 +899,16 @@ impl App {
                     },
                 );
             }
+            Kind::Tailscale => {
+                // No hay un mensaje de "conectado" dedicado: `reconcile()`
+                // sincroniza el estado real de Tailscale en cada sondeo, así
+                // que basta con reportar aquí si el comando en sí falló.
+                std::thread::spawn(move || {
+                    if let Err(err) = tailscale::up() {
+                        let _ = tx.send(Msg::Log(Some(idx), Level::Error, format!("tailscale: {err}")));
+                    }
+                });
+            }
         }
     }
 
@@ -961,13 +990,19 @@ impl App {
                     }
                 });
             }
+            Kind::Tailscale => {
+                std::thread::spawn(move || {
+                    if let Err(err) = tailscale::down() {
+                        let _ = tx.send(Msg::Log(Some(idx), Level::Error, format!("tailscale: {err}")));
+                    }
+                });
+            }
         }
     }
 
-    /// Conecta todos los perfiles de `kind` (o todos si `kind` es `None`).
-    pub fn connect_all(&mut self, kind: Option<Kind>) {
+    /// Conecta todos los perfiles (incluida la fila de Tailscale).
+    pub fn connect_all(&mut self) {
         let targets: Vec<usize> = (0..self.profiles.len())
-            .filter(|i| kind.is_none_or(|k| self.profiles[*i].kind == k))
             .filter(|i| !self.profiles[*i].state.is_up() && !self.profiles[*i].state.is_busy())
             .collect();
         if targets.is_empty() {
@@ -983,10 +1018,9 @@ impl App {
         }
     }
 
-    /// Desconecta todos los perfiles de `kind` (o todos si `kind` es `None`).
-    pub fn disconnect_all(&mut self, kind: Option<Kind>) {
+    /// Desconecta todos los perfiles (incluida la fila de Tailscale).
+    pub fn disconnect_all(&mut self) {
         let targets: Vec<usize> = (0..self.profiles.len())
-            .filter(|i| kind.is_none_or(|k| self.profiles[*i].kind == k))
             .filter(|i| self.profiles[*i].state.is_up())
             .collect();
         if targets.is_empty() {
@@ -1185,7 +1219,7 @@ impl App {
             };
             let _ = tx.send(msg);
         });
-        self.screen = Screen::Tailscale(TailscaleScreen::Status);
+        self.screen = Screen::Dashboard;
     }
 
     // ------------------------------------------------------------- mensajería
@@ -1426,6 +1460,27 @@ impl App {
                 }
             }
         }
+
+        // --- Tailscale ---------------------------------------------------
+        // No hay un flujo de "Connecting"/"Disconnecting" propio: cada sondeo
+        // simplemente refleja el `backend_state` real, así que un `up`/`down`
+        // en curso se resuelve solo en el siguiente `poll_interval_ms` sin
+        // quedar nunca atorado en un estado intermedio.
+        if let Some(idx) = self.profiles.iter().position(|p| p.kind == Kind::Tailscale) {
+            if let Some(status) = self.tailscale_status.clone() {
+                let target_state = if status.is_running() {
+                    State::Connected
+                } else {
+                    State::Disconnected
+                };
+                self.profiles[idx].enter(target_state);
+                self.profiles[idx].target = status
+                    .self_ips
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "tailscale".to_string());
+            }
+        }
     }
 
     fn addr_for(&self, device: Option<&str>) -> Option<String> {
@@ -1449,19 +1504,12 @@ impl App {
             .map(|i| i.name.clone())
     }
 
-    /// Perfiles conectados / total (del `Kind` visible, o de todos).
+    /// Perfiles conectados / total.
     pub fn summary(&self) -> (usize, usize) {
-        match self.screen {
-            Screen::Dashboard(kind) => {
-                let visible: Vec<&Profile> =
-                    self.profiles.iter().filter(|p| p.kind == kind).collect();
-                (visible.iter().filter(|p| p.state.is_up()).count(), visible.len())
-            }
-            _ => (
-                self.profiles.iter().filter(|p| p.state.is_up()).count(),
-                self.profiles.len(),
-            ),
-        }
+        (
+            self.profiles.iter().filter(|p| p.state.is_up()).count(),
+            self.profiles.len(),
+        )
     }
 }
 
@@ -1478,6 +1526,15 @@ fn build_profiles(openvpn: &[OpenVpnProfile], forti: &[FortiProfile]) -> Vec<Pro
     for (i, p) in forti.iter().enumerate() {
         profiles.push(Profile::new(p.name.clone(), Kind::Forti, i, p.host.clone()));
     }
+    // Tailscale no es una lista de perfiles — es una sola conexión de este
+    // equipo — pero vive en el mismo panel "VPNS", así que se representa
+    // como una única fila sintética; `cfg_index` no se usa para este `Kind`.
+    profiles.push(Profile::new(
+        "Tailscale".to_string(),
+        Kind::Tailscale,
+        0,
+        "tailscale".to_string(),
+    ));
     profiles
 }
 
