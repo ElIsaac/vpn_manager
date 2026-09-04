@@ -42,8 +42,8 @@ en el menú de **configuración** (`c`), no en el menú principal.
   nadie cerró (reconexiones automáticas del core, sesiones de ayer que
   siguen vivas) — y permite cerrar una o todas.
 - **Toggle de IPv6 real**: lee `/proc/sys/net/ipv6/conf/all/disable_ipv6` en
-  vez de asumir un estado, y alterna entre los dos scripts de
-  `../vpns/` (`ipv6_deshabilitar.sh` / `habilitar_ipv6.sh`).
+  vez de asumir un estado, y alterna entre los dos scripts instalados en
+  `/usr/local/libexec/vpn/` (`ipv6-disable.sh` / `ipv6-enable.sh`).
 - **Ambas VPNs a la vez o por separado**, sin bloquear la interfaz: cada
   conexión corre en su propio hilo y reporta por un canal.
 - **Adopción de sesiones existentes**: si ya había un túnel levantado (por
@@ -64,18 +64,34 @@ en el menú de **configuración** (`c`), no en el menú principal.
 
 ```bash
 cd /home/isaac/apps/vpn-tui
-./install.sh          # compila e instala `vpn` en ~/.local/bin
-sudo ./install.sh      # además instala openvpn3/openfortivpn/tailscale que falten
-                       # y escribe /etc/sudoers.d/vpn-tui
+sudo ./install.sh
 ```
+
+Instala en el layout estándar del sistema (por eso necesita `sudo`):
+
+| Qué | Dónde |
+| --- | --- |
+| binario | `/usr/local/bin/vpn` (root:root 755) |
+| scripts de IPv6 | `/usr/local/libexec/vpn/ipv6-{disable,enable}.sh` (root:root 755) |
+| entrada del lanzador | `/usr/share/applications/vpn.desktop` |
+| reglas sudo | `/etc/sudoers.d/vpn-tui` |
+| datos del usuario | `~/.local/share/vpn-tui/vpn-tui.db` (no se toca al reinstalar) |
+
+La compilación corre como tu usuario (no como root); solo la instalación de
+archivos es privilegiada. No hace falta tocar el `PATH`: `/usr/local/bin` ya
+está en el de cualquier shell. Con la entrada `.desktop` (`Terminal=true`)
+`vpn` aparece en el lanzador de aplicaciones y se abre en tu terminal
+predeterminada.
 
 El instalador reconoce Fedora/RHEL-like (`dnf`) y Debian/Ubuntu-like (`apt`):
 
 - `openfortivpn`: paquete oficial en ambos.
 - `openvpn3`: en Fedora viene del COPR de terceros `dsommers/openvpn3`
   (`dnf copr enable` + `dnf install`); en Debian/Ubuntu, del repo APT oficial
-  del proyecto (`swupdate.openvpn.net`, documentado en la
-  [wiki de OpenVPN3Linux](https://community.openvpn.net/openvpn/wiki/OpenVPN3Linux)).
+  del proyecto (`swupdate.openvpn.net`) si publica lista para tu codename —
+  hoy no cubre bookworm/noble; en Kali se usa el paquete nativo
+  `openvpn3-client`. Ver la
+  [wiki de OpenVPN3Linux](https://community.openvpn.net/openvpn/wiki/OpenVPN3Linux).
 - `tailscale`: instalador oficial (`curl -fsSL https://tailscale.com/install.sh | sh`),
   que ya cubre ambas familias de distro.
 
@@ -172,9 +188,15 @@ isaac ALL=(ALL) NOPASSWD: /usr/bin/openfortivpn
 isaac ALL=(ALL) NOPASSWD: /usr/bin/pkill -INT -x openfortivpn
 isaac ALL=(ALL) NOPASSWD: /usr/bin/pkill -TERM -x openfortivpn
 isaac ALL=(ALL) NOPASSWD: /usr/bin/pkill -KILL -x openfortivpn
-isaac ALL=(ALL) NOPASSWD: /home/isaac/apps/vpns/ipv6_deshabilitar.sh
-isaac ALL=(ALL) NOPASSWD: /home/isaac/apps/vpns/habilitar_ipv6.sh
+isaac ALL=(ALL) NOPASSWD: /usr/local/libexec/vpn/ipv6-disable.sh
+isaac ALL=(ALL) NOPASSWD: /usr/local/libexec/vpn/ipv6-enable.sh
 ```
+
+Los scripts de IPv6 se instalan en `/usr/local/libexec/vpn/` y son `root:root`
+justamente porque llevan `NOPASSWD`: una regla así apuntando a un archivo
+dentro del home (editable por el usuario) sería una escalada de privilegios
+trivial. Por lo mismo, las rutas de sudoers son fijas y nunca se leen de la
+base de datos.
 
 Las reglas de `pkill` están acotadas a la señal y al nombre exacto del proceso,
 así que no sirven para tocar nada más. La contrapartida es que afectan a *todos*

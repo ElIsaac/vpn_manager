@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=VPN
+GenericName=VPN Manager
+Comment=Gestiona túneles OpenVPN3, OpenFortiVPN y Tailscale desde la terminal
+Exec=/usr/local/bin/vpn
+Icon=network-vpn
+Terminal=true
+Categories=Network;
+Keywords=vpn;openvpn;openvpn3;fortivpn;openfortivpn;tailscale;tunnel;
+StartupNotify=false

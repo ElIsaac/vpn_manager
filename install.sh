@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # Instalador de vpn (antes vpn-tui): instala las dependencias del sistema
-# (openvpn3, openfortivpn, tailscale), compila, instala el binario y
-# configura sudoers.
+# (openvpn3, openfortivpn, tailscale), compila e instala en el layout estándar
+# del sistema, y configura sudoers.
 #
-#   ./install.sh            instala dependencias que falten + compila + instala en ~/.local/bin
-#   sudo ./install.sh       además escribe /etc/sudoers.d/vpn-tui
+#   sudo ./install.sh
+#
+# Layout (estándar FHS/XDG para un programa instalado a mano):
+#   /usr/local/bin/vpn                     binario
+#   /usr/local/libexec/vpn/ipv6-*.sh       scripts privilegiados (root:root)
+#   /usr/share/applications/vpn.desktop    entrada del lanzador
+#   ~/.local/share/vpn-tui/vpn-tui.db      datos por usuario (no se toca)
 #
 # Soporta Fedora/RHEL-like (dnf) y Debian/Ubuntu-like (apt). El resto del
 # sistema (systemd, sudoers) es igual en ambos.
@@ -13,9 +18,13 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_USER="${SUDO_USER:-$USER}"
 TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
-BIN_DIR="$TARGET_HOME/.local/bin"
+PREFIX="/usr/local"
+BIN_DIR="$PREFIX/bin"
+LIBEXEC_DIR="$PREFIX/libexec/vpn"
+DESKTOP_DIR="/usr/share/applications"
 SUDOERS_FILE="/etc/sudoers.d/vpn-tui"
-DB_PATH="${VPN_TUI_DB:-$TARGET_HOME/.local/share/vpn-tui/vpn-tui.db}"
+IPV6_DISABLE="$LIBEXEC_DIR/ipv6-disable.sh"
+IPV6_ENABLE="$LIBEXEC_DIR/ipv6-enable.sh"
 
 info()  { printf '\033[36m→\033[0m %s\n' "$*"; }
 ok()    { printf '\033[32m✓\033[0m %s\n' "$*"; }
@@ -129,11 +138,6 @@ install_tailscale() {
 }
 
 install_system_deps() {
-  if [[ $EUID -ne 0 ]]; then
-    warn "sin root: no instalo dependencias del sistema (openvpn3/openfortivpn/tailscale)"
-    warn "vuelve a ejecutar con sudo, o instálalas tú mismo"
-    return
-  fi
   # Cada dependencia es independiente: si una falla (repo caído, systemd
   # ausente en un contenedor, red intermitente, etc.) se avisa y se sigue con
   # las demás y con compilar/instalar el binario — no tiene sentido tronar
@@ -174,34 +178,34 @@ build() {
   ok "binario en $HERE/target/release/vpn"
 }
 
+# --- instalación ---------------------------------------------------------
+# Todo lo que se instala va como root al prefijo del sistema. No hace falta
+# tocar el PATH de ningún shell: /usr/local/bin ya está en el PATH por defecto
+# en Fedora, Debian, Ubuntu y Kali.
 install_bin() {
-  as_user mkdir -p "$BIN_DIR"
-  as_user install -m 755 "$HERE/target/release/vpn" "$BIN_DIR/vpn"
-  ok "instalado en $BIN_DIR/vpn"
-  ensure_bin_on_path
+  install -d -o root -g root -m 755 "$BIN_DIR"
+  install -o root -g root -m 755 "$HERE/target/release/vpn" "$BIN_DIR/vpn"
+  ok "binario en $BIN_DIR/vpn"
 }
 
-# Bajo `sudo`, $PATH es el de root (secure_path), no el del usuario real, así
-# que no sirve para detectar si falta $BIN_DIR — se revisa/edita el rc de cada
-# shell directamente. Idempotente: si ya hay una línea con .local/bin, no toca
-# nada.
-append_line_as_user() {
-  as_user bash -c 'printf "%s\n" "$1" >> "$2"' _ "$2" "$1"
+# Los scripts de IPv6 quedan root:root en /usr/local/libexec/vpn/ justamente
+# porque sudoers les da NOPASSWD: si vivieran en el home del usuario, cualquiera
+# con esa cuenta podría reescribirlos y ejecutarse como root sin contraseña.
+install_scripts() {
+  install -d -o root -g root -m 755 "$LIBEXEC_DIR"
+  install -o root -g root -m 755 "$HERE/scripts/ipv6-disable.sh" "$IPV6_DISABLE"
+  install -o root -g root -m 755 "$HERE/scripts/ipv6-enable.sh" "$IPV6_ENABLE"
+  ok "scripts de IPv6 en $LIBEXEC_DIR (root:root)"
 }
 
-ensure_bin_on_path() {
-  local rc changed=0
-  for rc in "$TARGET_HOME/.bashrc" "$TARGET_HOME/.zshrc"; do
-    [[ -f "$rc" ]] || as_user touch "$rc"
-    if ! grep -q '\.local/bin' "$rc" 2>/dev/null; then
-      append_line_as_user "$rc" ''
-      append_line_as_user "$rc" '# agregado por vpn-tui/install.sh'
-      append_line_as_user "$rc" 'export PATH="$HOME/.local/bin:$PATH"'
-      ok "agregué \$HOME/.local/bin al PATH en $(basename "$rc")"
-      changed=1
-    fi
-  done
-  [[ $changed -eq 1 ]] && warn "abre una terminal nueva (o: source ~/.zshrc / source ~/.bashrc)"
+install_desktop() {
+  local src="$HERE/vpn.desktop"
+  [[ -f "$src" ]] || { warn "no encuentro vpn.desktop; omito la entrada del lanzador"; return 0; }
+  install -d -o root -g root -m 755 "$DESKTOP_DIR"
+  install -o root -g root -m 644 "$src" "$DESKTOP_DIR/vpn.desktop"
+  # Refresca el caché del lanzador si la herramienta existe (no es crítica).
+  command -v update-desktop-database >/dev/null && update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+  ok "entrada del lanzador en $DESKTOP_DIR/vpn.desktop"
 }
 
 # --- alias viejo -------------------------------------------------------------
@@ -217,45 +221,23 @@ disable_old_alias() {
 # --- sudoers ------------------------------------------------------------------
 # openfortivpn necesita root, y la TUI no puede pedir contraseña (usa `sudo -n`).
 # Las reglas de pkill están acotadas a la señal y al nombre exacto del proceso.
-# El toggle de IPv6 ahora necesita ambos scripts (deshabilitar y habilitar).
-ipv6_script_from_db() {
-  local key="$1"
-  command -v sqlite3 >/dev/null || return 0
-  [[ -f "$DB_PATH" ]] || return 0
-  sqlite3 "$DB_PATH" "SELECT value FROM settings WHERE key = '$key'" 2>/dev/null
-}
-
+# Las rutas de los scripts de IPv6 son FIJAS y root:root a propósito: nunca se
+# leen de la base de datos ni de ningún lugar escribible por el usuario, porque
+# una regla NOPASSWD apuntando a un archivo que el usuario puede editar es una
+# escalada de privilegios directa.
 install_sudoers() {
-  if [[ $EUID -ne 0 ]]; then
-    warn "sin root: no toco $SUDOERS_FILE (vuelve a ejecutar con sudo si lo necesitas)"
-    return
-  fi
-
   local forti pkill_bin
   forti="$(command -v openfortivpn || true)"
   pkill_bin="$(command -v pkill || true)"
-  [[ -n "$forti" ]] || { warn "openfortivpn no encontrado: omito sudoers"; return; }
+  [[ -n "$forti" ]] || { warn "openfortivpn no encontrado: omito sudoers"; return 0; }
   [[ -n "$pkill_bin" ]] || die "no encuentro pkill"
 
-  # Primero se intenta leer la ruta ya migrada en la base de datos; si no
-  # existe todavía (primera instalación, antes de correr `vpn` una vez), se
-  # cae a la convención de este proyecto: scripts junto a `../vpns/`.
-  local disable_script enable_script
-  # `$(...)` en una asignación simple SÍ dispara `set -e` si el comando
-  # substituido falla (aunque `ipv6_script_from_db` termine en `return` por
-  # DB inexistente, que es el caso normal en toda instalación nueva) — se
-  # neutraliza con `|| true` para no tronar el instalador por esto.
-  disable_script="$(ipv6_script_from_db ipv6_disable_script || true)"
-  enable_script="$(ipv6_script_from_db ipv6_enable_script || true)"
-  [[ -n "$disable_script" ]] || disable_script="$(cd "$HERE/.." && pwd)/vpns/ipv6_deshabilitar.sh"
-  [[ -n "$enable_script" ]] || enable_script="$(cd "$HERE/.." && pwd)/vpns/habilitar_ipv6.sh"
-
   local ipv6_rules=""
-  if [[ -f "$disable_script" ]]; then
-    ipv6_rules+="$TARGET_USER ALL=(ALL) NOPASSWD: $disable_script"$'\n'
+  if [[ -f "$IPV6_DISABLE" ]]; then
+    ipv6_rules+="$TARGET_USER ALL=(ALL) NOPASSWD: $IPV6_DISABLE"$'\n'
   fi
-  if [[ -f "$enable_script" ]]; then
-    ipv6_rules+="$TARGET_USER ALL=(ALL) NOPASSWD: $enable_script"$'\n'
+  if [[ -f "$IPV6_ENABLE" ]]; then
+    ipv6_rules+="$TARGET_USER ALL=(ALL) NOPASSWD: $IPV6_ENABLE"$'\n'
   fi
 
   local tmp
@@ -276,10 +258,13 @@ EOF
 }
 
 main() {
+  [[ $EUID -eq 0 ]] || die "este instalador escribe en $PREFIX y /etc/sudoers.d: ejecútalo con 'sudo ./install.sh'"
   info "vpn → usuario $TARGET_USER"
   install_system_deps
   build
   install_bin
+  install_scripts
+  install_desktop
   disable_old_alias
   install_sudoers
   echo
