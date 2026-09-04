@@ -23,10 +23,13 @@ warn()  { printf '\033[33m!\033[0m %s\n' "$*"; }
 die()   { printf '\033[31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 
 as_user() {
+  # sudo -u arranca un shell no interactivo/no login: no lee .zshenv/.profile,
+  # así que ~/.cargo/bin (rustup) no queda en PATH aunque el usuario sí lo
+  # tenga en su sesión normal. Se agrega explícito para no depender de eso.
   if [[ $EUID -eq 0 && "$TARGET_USER" != root ]]; then
-    sudo -u "$TARGET_USER" "$@"
+    sudo -u "$TARGET_USER" env "PATH=$TARGET_HOME/.cargo/bin:$PATH" "$@"
   else
-    "$@"
+    PATH="$TARGET_HOME/.cargo/bin:$PATH" "$@"
   fi
 }
 
@@ -108,8 +111,27 @@ install_system_deps() {
 }
 
 # --- compilación -----------------------------------------------------------
+ensure_cargo() {
+  as_user command -v cargo >/dev/null && return
+  warn "cargo no está instalado para $TARGET_USER"
+  if [[ ! -t 0 ]]; then
+    die "falta cargo y no hay terminal para preguntar; instálalo: https://rustup.rs"
+  fi
+  read -rp "¿Instalar Rust (rustup) ahora para $TARGET_USER? [s/N] " reply
+  case "$reply" in
+    [sSyY]*)
+      command -v curl >/dev/null || die "falta curl, no puedo instalar rustup"
+      info "instalando rustup para $TARGET_USER…"
+      as_user bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable'
+      as_user command -v cargo >/dev/null || die "rustup se instaló pero no encuentro cargo; revisa manualmente"
+      ok "cargo instalado"
+      ;;
+    *) die "falta cargo (instala Rust: https://rustup.rs)" ;;
+  esac
+}
+
 build() {
-  as_user command -v cargo >/dev/null || die "falta cargo (instala Rust: https://rustup.rs)"
+  ensure_cargo
   info "compilando en modo release…"
   as_user env -C "$HERE" cargo build --release --quiet
   ok "binario en $HERE/target/release/vpn"
@@ -119,10 +141,30 @@ install_bin() {
   as_user mkdir -p "$BIN_DIR"
   as_user install -m 755 "$HERE/target/release/vpn" "$BIN_DIR/vpn"
   ok "instalado en $BIN_DIR/vpn"
-  case ":$PATH:" in
-    *":$BIN_DIR:"*) ;;
-    *) warn "$BIN_DIR no está en tu PATH; añádelo a ~/.zshrc" ;;
-  esac
+  ensure_bin_on_path
+}
+
+# Bajo `sudo`, $PATH es el de root (secure_path), no el del usuario real, así
+# que no sirve para detectar si falta $BIN_DIR — se revisa/edita el rc de cada
+# shell directamente. Idempotente: si ya hay una línea con .local/bin, no toca
+# nada.
+append_line_as_user() {
+  as_user bash -c 'printf "%s\n" "$1" >> "$2"' _ "$1" "$2"
+}
+
+ensure_bin_on_path() {
+  local rc changed=0
+  for rc in "$TARGET_HOME/.bashrc" "$TARGET_HOME/.zshrc"; do
+    [[ -f "$rc" ]] || as_user touch "$rc"
+    if ! grep -q '\.local/bin' "$rc" 2>/dev/null; then
+      append_line_as_user "$rc" ''
+      append_line_as_user "$rc" '# agregado por vpn-tui/install.sh'
+      append_line_as_user "$rc" 'export PATH="$HOME/.local/bin:$PATH"'
+      ok "agregué \$HOME/.local/bin al PATH en $(basename "$rc")"
+      changed=1
+    fi
+  done
+  [[ $changed -eq 1 ]] && warn "abre una terminal nueva (o: source ~/.zshrc / source ~/.bashrc)"
 }
 
 # --- alias viejo -------------------------------------------------------------
