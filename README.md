@@ -26,9 +26,13 @@ en el menú de **configuración** (`c`), no en el menú principal.
 ## Características
 
 - **Perfiles en SQLite**, no en un `config.toml` estático: se agregan, editan
-  y borran desde la propia TUI (menú de config → Perfiles), con un formulario
-  y un explorador de archivos (`F3`) para elegir el `.ovpn` sin teclear la
-  ruta a mano.
+  y borran desde la propia TUI (menú de config → Perfiles).
+- **Alta de OpenVPN3 en dos pasos**, en el orden en que se piensa: primero el
+  archivo (arrastrándolo, con el explorador del sistema en `F2`, con el de la
+  terminal en `F3`, o tecleando la ruta) y solo después el nombre, que es
+  opcional — se sugiere el del archivo y basta `enter` para omitirlo. Deja de
+  serlo en cuanto hay un segundo perfil del mismo tipo, y la pantalla lo avisa
+  ahí mismo.
 - **Arrastrar el `.ovpn` a la ventana funciona**: no hay drag & drop nativo en
   una terminal, pero al soltar un archivo el emulador pega su ruta, y la zona
   de importación la entiende venga como venga — cruda, entre comillas, con los
@@ -168,7 +172,8 @@ ejecución.
 | `↑` `↓` | moverse en el menú o en una lista |
 | `enter` | entrar / confirmar |
 | `n` / `e` / `x` | nuevo / editar / borrar perfil (en una lista de perfiles) |
-| `F3` | buscar archivo (campos de ruta, en el formulario o en General) |
+| `F2` | explorador de archivos del sistema (zenity/kdialog/yad) |
+| `F3` | explorador dentro de la terminal (campos de ruta, en el formulario o en General) |
 | arrastrar / `ctrl+shift+v` | soltar o pegar la ruta de un `.ovpn` en la zona de importación |
 | `tab` / `shift-tab` | siguiente / anterior campo |
 | `t` | alternar IPv6 (en la pantalla de estado de IPv6) |

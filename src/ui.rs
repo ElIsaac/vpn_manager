@@ -9,7 +9,8 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{App, ConfigScreen, Focus, Kind, LogEntry, Screen, TailscaleScreen};
+use crate::app::{App, ConfigScreen, Focus, FormStep, Kind, LogEntry, Screen, TailscaleScreen};
+use crate::filedialog;
 use crate::event::Level;
 use crate::vpn::{human_bytes, human_duration, State};
 
@@ -524,7 +525,7 @@ fn render_key_hints(frame: &mut Frame, area: Rect, keys: &[(&str, &str)]) {
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let rows: [(&str, &str); 16] = [
+    let rows: [(&str, &str); 17] = [
         ("← / →", "cambiar de panel (VPNS, registro, ⚙ configuración)"),
         ("↑ / k, ↓ / j", "moverse en listas / desplazar el registro"),
         ("1 / 2 / 3", "saltar selección a OpenVPN3 / OpenFortiVPN / Tailscale"),
@@ -535,7 +536,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("e", "exit-node de Tailscale (con Tailscale seleccionado)"),
         ("R", "rutas anunciadas de Tailscale (con Tailscale seleccionado)"),
         ("n / e / x", "nuevo / editar / borrar perfil (listas de config)"),
-        ("F3", "elegir archivo (zona de importación)"),
+        ("F2", "explorador de archivos del sistema (zona de importación)"),
+        ("F3", "explorador dentro de la terminal (zona de importación)"),
         ("tab / shift-tab", "siguiente / anterior campo (dentro de un formulario)"),
         ("pgup / pgdn, g / G", "desplazar el registro"),
         ("r", "limpiar el registro"),
@@ -727,7 +729,7 @@ fn draw_setup(frame: &mut Frame, app: &App, kind: Kind) {
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "  enter → abre el formulario con la zona de importación",
+                "  enter → paso 1: elegir el archivo · paso 2: ponerle nombre",
                 Style::new().fg(MUTED),
             )),
         ],
@@ -858,6 +860,149 @@ fn draw_profile_form(frame: &mut Frame, app: &App) {
     let Some(form) = &app.profile_form else {
         return;
     };
+    match form.step {
+        FormStep::PickFile => draw_step_pick_file(frame, app, form),
+        FormStep::Name => draw_step_name(frame, app, form),
+        FormStep::All => draw_form_all(frame, form, app.gui_picker.is_some()),
+    }
+}
+
+/// Paso 1 del alta: solo el archivo. Nada de nombre todavía — preguntarlo antes
+/// de saber qué se está importando es al revés de como se piensa.
+fn draw_step_pick_file(frame: &mut Frame, app: &App, form: &crate::app::ProfileForm) {
+    let title = format!("nuevo perfil {} · paso 1 de 2: archivo", form.kind.label());
+    let (body, footer) = modal(frame, &title, 72, 60);
+
+    let [drop_area, rest] =
+        Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).areas(body);
+
+    let value = form
+        .path_idx()
+        .map(|i| form.fields[i].input.value())
+        .unwrap_or_default();
+    if app.gui_picker_busy {
+        draw_dropzone_waiting(frame, drop_area, app.ticks);
+    } else {
+        draw_dropzone(frame, drop_area, "archivo .ovpn", value, true);
+    }
+
+    let mut lines = vec![Line::from("")];
+    match app.gui_picker {
+        Some(_) => lines.push(Line::from(vec![
+            Span::styled("  F2 ", Style::new().fg(ACCENT).bold()),
+            Span::styled(
+                "abre el explorador de archivos del sistema",
+                Style::new().fg(Color::White),
+            ),
+        ])),
+        None => lines.push(Line::from(Span::styled(
+            format!("  sin explorador del sistema: {}", filedialog::unavailable_reason()),
+            Style::new().fg(MUTED),
+        ))),
+    }
+    lines.push(Line::from(vec![
+        Span::styled("  F3 ", Style::new().fg(ACCENT).bold()),
+        Span::styled("explorador dentro de la terminal", Style::new().fg(Color::White)),
+    ]));
+    if let Some(err) = &form.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  {err}"),
+            Style::new().fg(Color::Red),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), rest);
+
+    let mut keys = vec![("enter", "continuar")];
+    if app.gui_picker.is_some() {
+        keys.push(("F2", "explorador del sistema"));
+    }
+    keys.push(("F3", "explorador en terminal"));
+    keys.push(("esc", "cancelar"));
+    render_key_hints(frame, footer, &keys);
+}
+
+/// Paso 2: el nombre, opcional salvo que ya haya otro perfil del mismo tipo.
+fn draw_step_name(frame: &mut Frame, app: &App, form: &crate::app::ProfileForm) {
+    let title = format!("nuevo perfil {} · paso 2 de 2: nombre", form.kind.label());
+    let (body, footer) = modal(frame, &title, 72, 50);
+
+    let required = app.name_required();
+    let idx = form.name_idx();
+    let value = form.fields[idx].input.value();
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            if required {
+                "  ¿Cómo quieres llamar a este perfil?"
+            } else {
+                "  ¿Quieres darle un nombre a este perfil? (opcional)"
+            },
+            Style::new().fg(Color::White).bold(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ▶ ", Style::new().fg(ACCENT)),
+            Span::styled(
+                if value.is_empty() {
+                    // Con nombre obligatorio, ofrecer "enter para omitir" sería
+                    // mentir: enter ahí solo devuelve un error.
+                    match (form.suggested_name(), required) {
+                        (Some(s), true) => format!("(sugerencia: {s})"),
+                        (Some(s), false) => format!("(sugerencia: {s} — enter para omitir)"),
+                        (None, true) => "(escribe un nombre)".to_string(),
+                        (None, false) => "(enter para omitir)".to_string(),
+                    }
+                } else {
+                    value.to_string()
+                },
+                if value.is_empty() {
+                    Style::new().fg(MUTED)
+                } else {
+                    Style::new().fg(Color::White).bold()
+                },
+            ),
+        ]),
+        Line::from(""),
+    ];
+    if required {
+        lines.push(Line::from(Span::styled(
+            "  Ya hay otro perfil de este tipo: el nombre es obligatorio para distinguirlos en el panel.",
+            Style::new().fg(Color::Yellow),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!("  Sin nombre aparecerá solo como «{}».", form.kind.label()),
+            Style::new().fg(MUTED),
+        )));
+    }
+    if let Some(path) = form.path_idx().map(|i| form.fields[i].input.value()) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  archivo: {path}"),
+            Style::new().fg(MUTED),
+        )));
+    }
+    if let Some(err) = &form.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  {err}"),
+            Style::new().fg(Color::Red),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
+
+    render_key_hints(
+        frame,
+        footer,
+        &[
+            ("enter", if required { "guardar" } else { "guardar / omitir" }),
+            ("esc", "volver al archivo"),
+        ],
+    );
+}
+
+fn draw_form_all(frame: &mut Frame, form: &crate::app::ProfileForm, gui: bool) {
     let title = match form.editing_id {
         Some(_) => format!("editar perfil {}", form.kind.label()),
         None => format!("nuevo perfil {}", form.kind.label()),
@@ -920,7 +1065,10 @@ fn draw_profile_form(frame: &mut Frame, app: &App) {
         ("esc", "cancelar"),
     ];
     if pickable {
-        keys.insert(1, ("F3", "elegir archivo"));
+        keys.insert(1, ("F3", "explorador en terminal"));
+        if gui {
+            keys.insert(1, ("F2", "explorador del sistema"));
+        }
     }
     render_key_hints(frame, footer, &keys);
 }
@@ -969,6 +1117,39 @@ fn draw_dropzone(frame: &mut Frame, area: Rect, label: &str, value: &str, focuse
         ]
     };
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Mismo recuadro, pero esperando a que el usuario termine en la ventana del
+/// sistema: sin esto la TUI parecería congelada.
+fn draw_dropzone_waiting(frame: &mut Frame, area: Rect, ticks: u64) {
+    if area.height < 3 {
+        return;
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::new().fg(ACCENT))
+        .title(Span::styled(" ⤓ archivo .ovpn ", Style::new().fg(ACCENT).bold()))
+        .padding(Padding::new(1, 1, 0, 0));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let spinner = SPINNER[(ticks as usize) % SPINNER.len()];
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                format!("{spinner}  esperando al explorador del sistema…"),
+                Style::new().fg(Color::White).bold(),
+            ))
+            .centered(),
+            Line::from(Span::styled(
+                "elige el archivo en la ventana que se abrió (o ciérrala para cancelar)",
+                Style::new().fg(MUTED),
+            ))
+            .centered(),
+        ]),
+        inner,
+    );
 }
 
 fn draw_file_picker(frame: &mut Frame, app: &App) {

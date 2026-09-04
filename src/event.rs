@@ -62,6 +62,13 @@ pub enum Msg {
         text: String,
     },
 
+    /// Cerró el diálogo de archivo gráfico del sistema (zenity/kdialog/yad).
+    /// `path: None` = el usuario canceló, que no es un error.
+    GuiPickerDone {
+        path: Option<std::path::PathBuf>,
+        err: Option<String>,
+    },
+
     /// Estado del sistema recogido periódicamente.
     Poll(Box<Snapshot>),
 }

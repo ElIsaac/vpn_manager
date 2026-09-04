@@ -3,6 +3,7 @@
 mod app;
 mod db;
 mod event;
+mod filedialog;
 mod ui;
 mod vpn;
 
@@ -15,7 +16,9 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 
-use app::{App, ConfigScreen, FileTarget, Focus, FormOrigin, Kind, Screen, TailscaleScreen};
+use app::{
+    App, ConfigScreen, FileTarget, Focus, FormOrigin, FormStep, Kind, Screen, TailscaleScreen,
+};
 use db::Db;
 use event::{Events, Level, Msg};
 
@@ -476,7 +479,18 @@ fn profile_form_exit(kind: Kind, origin: FormOrigin) -> Screen {
 }
 
 fn on_key_profile_form(app: &mut App, key: KeyEvent) {
+    // Con el diálogo del sistema abierto la pantalla está esperando: aceptar
+    // teclas aquí solo serviría para dejar el formulario en un estado raro
+    // cuando llegue la respuesta.
+    if app.gui_picker_busy {
+        return;
+    }
+    let step = app.profile_form.as_ref().map(|f| f.step).unwrap_or(FormStep::All);
+
     match key.code {
+        // En el paso del nombre, `esc` es "volver al archivo", no "cancelar
+        // todo": ya se hizo el trabajo de elegirlo.
+        KeyCode::Esc if step == FormStep::Name => app.back_profile_step(),
         KeyCode::Esc => {
             let (kind, origin) = app
                 .profile_form
@@ -485,6 +499,9 @@ fn on_key_profile_form(app: &mut App, key: KeyEvent) {
                 .unwrap_or((Kind::OpenVpn, FormOrigin::ConfigList));
             app.screen = profile_form_exit(kind, origin);
         }
+        // Explorador de archivos del escritorio (el de siempre), frente al F3
+        // que abre el que vive dentro de la terminal.
+        KeyCode::F(2) => app.open_gui_file_picker(),
         KeyCode::Tab => {
             if let Some(form) = app.profile_form.as_mut() {
                 form.next_field();
@@ -503,6 +520,11 @@ fn on_key_profile_form(app: &mut App, key: KeyEvent) {
                 let start = start.parent().map(std::path::Path::to_path_buf);
                 app.open_file_picker(FileTarget::Profile(idx), start.as_deref());
             }
+        }
+        // Paso 1 del asistente: `enter` no guarda todavía, avanza a preguntar
+        // el nombre.
+        KeyCode::Enter if step == FormStep::PickFile => {
+            app.advance_profile_step();
         }
         KeyCode::Enter => {
             let before = app.profile_form.as_ref().map(|f| (f.kind, f.origin));

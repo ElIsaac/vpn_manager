@@ -1,7 +1,7 @@
 //! Estado de la aplicación y transiciones.
 
 use std::collections::{HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -9,6 +9,7 @@ use ratatui_explorer::FileExplorer;
 use tui_input::Input;
 
 use crate::db::{Db, FortiProfile, General, OpenVpnProfile};
+use crate::filedialog::{self, GuiPicker};
 use crate::event::{Level, Msg, Snapshot};
 use crate::vpn::{self, fortivpn, human_bytes, openvpn3, tailscale, Iface, State, Stats};
 
@@ -49,6 +50,14 @@ pub fn display_name(kind: Kind, name: Option<&str>) -> String {
 /// Texto de la fila cuando ese tipo de VPN no tiene ningún perfil todavía.
 pub fn unconfigured_name(kind: Kind) -> String {
     format!("{} No Configurada", kind.label())
+}
+
+/// Nombre que se sugiere para un perfil recién importado: el del archivo, sin
+/// extensión (`…/thinkpad.ovpn` → `thinkpad`). Solo es una sugerencia: el
+/// nombre sigue siendo opcional.
+pub fn suggested_profile_name(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_string_lossy().trim().to_string();
+    (!stem.is_empty()).then_some(stem)
 }
 
 /// Regla de nombres: el primer perfil de un tipo puede ir sin nombre (basta el
@@ -249,6 +258,17 @@ impl FormField {
     }
 }
 
+/// En qué paso va el formulario. El alta de OpenVPN3 se hace por pasos —
+/// primero el archivo, después el nombre — porque preguntar el nombre antes de
+/// saber qué archivo es resulta al revés de como lo piensa quien lo usa.
+/// Editar, y FortiVPN entero, siguen mostrando todos los campos juntos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormStep {
+    All,
+    PickFile,
+    Name,
+}
+
 /// Formulario de alta/edición de un perfil (OpenVPN3 o FortiVPN).
 pub struct ProfileForm {
     pub kind: Kind,
@@ -257,15 +277,18 @@ pub struct ProfileForm {
     pub focus: usize,
     pub error: Option<String>,
     pub origin: FormOrigin,
+    pub step: FormStep,
 }
 
 impl ProfileForm {
+    /// Índices de campo. El orden es el del recorrido mental: primero lo que
+    /// define la conexión, el nombre (opcional) hasta el final.
+    pub const OVPN_PATH: usize = 0;
+    pub const OVPN_NAME: usize = 1;
+    pub const FORTI_NAME: usize = 6;
+
     pub fn new_openvpn(existing: Option<&OpenVpnProfile>) -> Self {
         let fields = vec![
-            FormField::new(
-                "nombre (opcional)",
-                existing.and_then(|p| p.name.clone()).unwrap_or_default(),
-            ),
             FormField::new(
                 "archivo .ovpn",
                 existing
@@ -273,23 +296,30 @@ impl ProfileForm {
                     .unwrap_or_default(),
             )
             .with_picker(),
+            FormField::new(
+                "nombre (opcional)",
+                existing.and_then(|p| p.name.clone()).unwrap_or_default(),
+            ),
         ];
+        // Alta = asistente por pasos; edición = todo a la vista.
+        let step = if existing.is_some() {
+            FormStep::All
+        } else {
+            FormStep::PickFile
+        };
         Self {
             kind: Kind::OpenVpn,
             editing_id: existing.map(|p| p.id),
             fields,
-            focus: 0,
+            focus: Self::OVPN_PATH,
             error: None,
             origin: FormOrigin::ConfigList,
+            step,
         }
     }
 
     pub fn new_forti(existing: Option<&FortiProfile>) -> Self {
         let fields = vec![
-            FormField::new(
-                "nombre (opcional)",
-                existing.and_then(|p| p.name.clone()).unwrap_or_default(),
-            ),
             FormField::new("host:puerto", existing.map(|p| p.host.clone()).unwrap_or_default()),
             FormField::new("usuario", existing.map(|p| p.username.clone()).unwrap_or_default()),
             FormField::new(
@@ -309,6 +339,10 @@ impl ProfileForm {
                 "extra_args (coma)",
                 existing.map(|p| p.extra_args.join(",")).unwrap_or_default(),
             ),
+            FormField::new(
+                "nombre (opcional)",
+                existing.and_then(|p| p.name.clone()).unwrap_or_default(),
+            ),
         ];
         Self {
             kind: Kind::Forti,
@@ -317,7 +351,28 @@ impl ProfileForm {
             focus: 0,
             error: None,
             origin: FormOrigin::ConfigList,
+            step: FormStep::All,
         }
+    }
+
+    /// Índice del campo "nombre" según el tipo.
+    pub fn name_idx(&self) -> usize {
+        match self.kind {
+            Kind::Forti => Self::FORTI_NAME,
+            _ => Self::OVPN_NAME,
+        }
+    }
+
+    /// Índice del campo de ruta, si el formulario tiene uno.
+    pub fn path_idx(&self) -> Option<usize> {
+        self.fields.iter().position(|f| f.pickable)
+    }
+
+    /// El nombre del archivo elegido, para sugerirlo como nombre de perfil.
+    pub fn suggested_name(&self) -> Option<String> {
+        let idx = self.path_idx()?;
+        let value = self.fields[idx].input.value();
+        (!value.is_empty()).then(|| suggested_profile_name(Path::new(value)))?
     }
 
     fn opened_from_setup(mut self) -> Self {
@@ -325,14 +380,27 @@ impl ProfileForm {
         self
     }
 
+    /// Cambia de paso dejando el foco en el único campo visible de ese paso.
+    pub fn set_step(&mut self, step: FormStep) {
+        self.step = step;
+        self.focus = match step {
+            FormStep::All => self.focus.min(self.fields.len().saturating_sub(1)),
+            FormStep::PickFile => self.path_idx().unwrap_or(0),
+            FormStep::Name => self.name_idx(),
+        };
+        self.error = None;
+    }
+
+    /// En los pasos del asistente solo hay un campo visible: `tab` únicamente
+    /// tiene sentido con el formulario completo.
     pub fn next_field(&mut self) {
-        if !self.fields.is_empty() {
+        if self.step == FormStep::All && !self.fields.is_empty() {
             self.focus = (self.focus + 1) % self.fields.len();
         }
     }
 
     pub fn prev_field(&mut self) {
-        if !self.fields.is_empty() {
+        if self.step == FormStep::All && !self.fields.is_empty() {
             self.focus = (self.focus + self.fields.len() - 1) % self.fields.len();
         }
     }
@@ -557,6 +625,11 @@ pub struct App {
     pub general_form: Option<GeneralForm>,
     pub file_explorer: Option<FileExplorer>,
     pub file_target: Option<FileTarget>,
+    /// Explorador gráfico disponible en este equipo (`None` = sin sesión
+    /// gráfica o sin zenity/kdialog/yad; se detecta una sola vez al arrancar).
+    pub gui_picker: Option<GuiPicker>,
+    /// Diálogo gráfico abierto: spinner en pantalla y teclas bloqueadas.
+    pub gui_picker_busy: bool,
     pub all_openvpn_sessions: Vec<openvpn3::Session>,
     pub sessions_selected: usize,
     /// Sesiones openvpn3 con un cierre en curso (spinner + teclas bloqueadas).
@@ -614,6 +687,8 @@ impl App {
             general_form: None,
             file_explorer: None,
             file_target: None,
+            gui_picker: filedialog::detect(),
+            gui_picker_busy: false,
             all_openvpn_sessions: Vec::new(),
             sessions_selected: 0,
             killing_sessions: HashSet::new(),
@@ -901,6 +976,95 @@ impl App {
         }
     }
 
+    /// Cuántos perfiles de `kind` quedarían aparte del que se está editando.
+    /// Con al menos uno más, el nombre deja de ser opcional.
+    fn others_of_kind(&self, kind: Kind, editing_id: Option<i64>) -> usize {
+        match kind {
+            Kind::OpenVpn => self
+                .openvpn_profiles
+                .iter()
+                .filter(|p| Some(p.id) != editing_id)
+                .count(),
+            Kind::Forti => self
+                .forti_profiles
+                .iter()
+                .filter(|p| Some(p.id) != editing_id)
+                .count(),
+            Kind::Tailscale => 0,
+        }
+    }
+
+    /// ¿El perfil que se está capturando obliga a poner nombre? La pantalla lo
+    /// anuncia en el paso del nombre, en vez de dejar que se descubra al fallar
+    /// el guardado.
+    pub fn name_required(&self) -> bool {
+        self.profile_form
+            .as_ref()
+            .is_some_and(|f| self.others_of_kind(f.kind, f.editing_id) > 0)
+    }
+
+    /// Paso 1 → paso 2 del alta de OpenVPN3. Valida el archivo aquí mismo: no
+    /// tiene sentido preguntar el nombre de algo que todavía no existe.
+    pub fn advance_profile_step(&mut self) -> bool {
+        let Some(form) = self.profile_form.as_mut() else {
+            return false;
+        };
+        if form.step != FormStep::PickFile {
+            return false;
+        }
+        let Some(idx) = form.path_idx() else {
+            return false;
+        };
+        let value = form.fields[idx].input.value().trim().to_string();
+        if value.is_empty() {
+            form.error = Some("elige el archivo .ovpn para continuar".into());
+            return false;
+        }
+        if !Path::new(&value).is_file() {
+            form.error = Some(format!("no encuentro el archivo {value}"));
+            return false;
+        }
+        form.set_step(FormStep::Name);
+        true
+    }
+
+    /// Paso 2 → paso 1 (`esc`), conservando el archivo ya elegido.
+    pub fn back_profile_step(&mut self) {
+        if let Some(form) = self.profile_form.as_mut() {
+            if form.step == FormStep::Name {
+                form.set_step(FormStep::PickFile);
+            }
+        }
+    }
+
+    /// Abre el explorador de archivos del escritorio (zenity/kdialog/yad) en un
+    /// hilo, para no bloquear el dibujado mientras el usuario elige.
+    pub fn open_gui_file_picker(&mut self) {
+        let Some(picker) = self.gui_picker else {
+            self.toast(
+                Level::Warn,
+                format!(
+                    "sin explorador del sistema: {} (usa F3)",
+                    filedialog::unavailable_reason()
+                ),
+            );
+            return;
+        };
+        if self.gui_picker_busy {
+            return;
+        }
+        let start = self
+            .profile_form
+            .as_ref()
+            .and_then(|f| f.path_idx().map(|i| f.fields[i].input.value().to_string()))
+            .map(PathBuf::from)
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .filter(|p| p.is_dir())
+            .or_else(dirs::home_dir);
+        self.gui_picker_busy = true;
+        filedialog::open_async(picker, start, self.tx.clone());
+    }
+
     /// Guarda el `ProfileForm` abierto. `Ok(true)` si guardó y debe cerrarse.
     pub fn save_profile_form(&mut self) -> bool {
         let Some(form) = self.profile_form.as_mut() else {
@@ -908,8 +1072,10 @@ impl App {
         };
         let value = |i: usize| form.fields[i].input.value().trim().to_string();
 
-        // Cuántos perfiles de este tipo quedarían aparte del que se guarda:
-        // con al menos uno más, el nombre deja de ser opcional.
+        // Con al menos un perfil más de este tipo, el nombre deja de ser
+        // opcional (si no, quedarían dos filas idénticas en el panel). Se
+        // cuenta aquí sobre los campos y no con `others_of_kind`, que toma
+        // `&self` entero y chocaría con el préstamo de `self.profile_form`.
         let others = match form.kind {
             Kind::OpenVpn => self
                 .openvpn_profiles
@@ -926,14 +1092,14 @@ impl App {
 
         let result = match form.kind {
             Kind::OpenVpn => {
-                let name = match validate_profile_name(others, &value(0)) {
+                let name = match validate_profile_name(others, &value(ProfileForm::OVPN_NAME)) {
                     Ok(name) => name,
                     Err(err) => {
                         form.error = Some(err);
                         return false;
                     }
                 };
-                let path = value(1);
+                let path = value(ProfileForm::OVPN_PATH);
                 if path.is_empty() {
                     form.error = Some("falta el archivo .ovpn".into());
                     return false;
@@ -952,19 +1118,19 @@ impl App {
                 }
             }
             Kind::Forti => {
-                let name = match validate_profile_name(others, &value(0)) {
+                let name = match validate_profile_name(others, &value(ProfileForm::FORTI_NAME)) {
                     Ok(name) => name,
                     Err(err) => {
                         form.error = Some(err);
                         return false;
                     }
                 };
-                let host = value(1);
-                let username = value(2);
-                let password = value(3);
-                let password_env = value(4);
-                let trusted_cert = value(5);
-                let extra_args: Vec<String> = value(6)
+                let host = value(0);
+                let username = value(1);
+                let password = value(2);
+                let password_env = value(3);
+                let trusted_cert = value(4);
+                let extra_args: Vec<String> = value(5)
                     .split(',')
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
@@ -1738,6 +1904,17 @@ impl App {
                 self.toast(level, text);
             }
 
+            // Volvió el explorador gráfico del sistema. Sin ruta = el usuario
+            // canceló, y cancelar no merece un error en pantalla.
+            Msg::GuiPickerDone { path, err } => {
+                self.gui_picker_busy = false;
+                match (path, err) {
+                    (Some(path), _) => self.paste_into_dropzone(path),
+                    (None, Some(err)) => self.toast(Level::Error, err),
+                    (None, None) => {}
+                }
+            }
+
             Msg::Poll(snapshot) => self.reconcile(*snapshot),
         }
     }
@@ -2240,11 +2417,10 @@ mod tests {
         std::fs::write(&file, "client\n").unwrap();
 
         app.open_profile_form_new(Kind::OpenVpn);
-        app.profile_form.as_mut().unwrap().focus = 1; // el dropzone
         app.on_paste(format!("{}\n", file.display()));
 
         let form = app.profile_form.as_ref().unwrap();
-        assert_eq!(form.fields[1].input.value(), file.to_string_lossy());
+        assert_eq!(form.fields[ProfileForm::OVPN_PATH].input.value(), file.to_string_lossy());
         assert_eq!(form.error, None);
         // Sigue en el formulario: no se guardó ni se salió por el `\n`.
         assert_eq!(app.screen, Screen::Config(ConfigScreen::ProfileForm));
@@ -2260,13 +2436,20 @@ mod tests {
         std::fs::write(&file, "client\n").unwrap();
 
         app.open_profile_form_new(Kind::OpenVpn);
-        app.profile_form.as_mut().unwrap().focus = 0; // campo "nombre"
+        app.profile_form.as_mut().unwrap().focus = ProfileForm::OVPN_NAME;
         app.on_paste(file.to_string_lossy().into_owned());
 
         let form = app.profile_form.as_ref().unwrap();
-        assert_eq!(form.fields[1].input.value(), file.to_string_lossy());
-        assert!(form.fields[0].input.value().is_empty(), "el nombre queda limpio");
-        assert_eq!(form.focus, 1, "el foco se mueve a la zona de importación");
+        assert_eq!(form.fields[ProfileForm::OVPN_PATH].input.value(), file.to_string_lossy());
+        assert!(
+            form.fields[ProfileForm::OVPN_NAME].input.value().is_empty(),
+            "el nombre queda limpio"
+        );
+        assert_eq!(
+            form.focus,
+            ProfileForm::OVPN_PATH,
+            "el foco se mueve a la zona de importación"
+        );
         std::fs::remove_file(&file).ok();
     }
 
@@ -2276,11 +2459,10 @@ mod tests {
     fn una_ruta_inexistente_avisa_en_el_dropzone() {
         let mut app = test_app();
         app.open_profile_form_new(Kind::OpenVpn);
-        app.profile_form.as_mut().unwrap().focus = 1;
         app.on_paste("/no/existe/x.ovpn".to_string());
 
         let form = app.profile_form.as_ref().unwrap();
-        assert_eq!(form.fields[1].input.value(), "/no/existe/x.ovpn");
+        assert_eq!(form.fields[ProfileForm::OVPN_PATH].input.value(), "/no/existe/x.ovpn");
         assert!(form.error.as_deref().unwrap_or_default().contains("no existe"));
     }
 
@@ -2292,11 +2474,10 @@ mod tests {
         std::fs::write(&file, "client\n").unwrap();
 
         app.open_profile_form_new(Kind::OpenVpn);
-        app.profile_form.as_mut().unwrap().focus = 1;
         app.on_paste(file.to_string_lossy().into_owned());
 
         let form = app.profile_form.as_ref().unwrap();
-        assert_eq!(form.fields[1].input.value(), file.to_string_lossy());
+        assert_eq!(form.fields[ProfileForm::OVPN_PATH].input.value(), file.to_string_lossy());
         assert!(form.error.as_deref().unwrap_or_default().contains(".ovpn"));
         std::fs::remove_file(&file).ok();
     }
@@ -2306,11 +2487,126 @@ mod tests {
     fn pegar_texto_normal_llena_el_campo_enfocado() {
         let mut app = test_app();
         app.open_profile_form_new(Kind::Forti);
-        app.profile_form.as_mut().unwrap().focus = 1; // host:puerto
+        app.profile_form.as_mut().unwrap().focus = 0; // host:puerto
         app.on_paste("vpn.ejemplo.com:10443\n".to_string());
 
         let form = app.profile_form.as_ref().unwrap();
-        assert_eq!(form.fields[1].input.value(), "vpn.ejemplo.com:10443");
+        assert_eq!(form.fields[0].input.value(), "vpn.ejemplo.com:10443");
+    }
+
+    // -------------------------------------------------- asistente de dos pasos
+
+    fn tmp_ovpn(name: &str) -> PathBuf {
+        let file = std::env::temp_dir().join(name);
+        std::fs::write(&file, "client\n").unwrap();
+        file
+    }
+
+    /// El alta de OpenVPN3 va por pasos: primero el archivo, y solo después se
+    /// pregunta el nombre. Antes era un formulario con todo a la vez.
+    #[test]
+    fn el_alta_de_openvpn_pregunta_primero_el_archivo_y_luego_el_nombre() {
+        let mut app = test_app();
+        let file = tmp_ovpn("vpn-tui-wizard-1.ovpn");
+
+        app.open_profile_form_new(Kind::OpenVpn);
+        let form = app.profile_form.as_ref().unwrap();
+        assert_eq!(form.step, FormStep::PickFile);
+        assert_eq!(form.focus, ProfileForm::OVPN_PATH, "arranca en el dropzone");
+
+        app.on_paste(file.to_string_lossy().into_owned());
+        assert!(app.advance_profile_step(), "con archivo válido sí avanza");
+
+        let form = app.profile_form.as_ref().unwrap();
+        assert_eq!(form.step, FormStep::Name);
+        assert_eq!(form.focus, ProfileForm::OVPN_NAME);
+
+        // `esc` en el paso del nombre regresa al del archivo, sin perderlo.
+        app.back_profile_step();
+        let form = app.profile_form.as_ref().unwrap();
+        assert_eq!(form.step, FormStep::PickFile);
+        assert_eq!(form.fields[ProfileForm::OVPN_PATH].input.value(), file.to_string_lossy());
+        std::fs::remove_file(&file).ok();
+    }
+
+    /// Sin archivo (o con uno inexistente) no se pasa al paso del nombre.
+    #[test]
+    fn no_se_avanza_de_paso_sin_un_archivo_valido() {
+        let mut app = test_app();
+        app.open_profile_form_new(Kind::OpenVpn);
+
+        assert!(!app.advance_profile_step(), "sin ruta no avanza");
+        let form = app.profile_form.as_ref().unwrap();
+        assert_eq!(form.step, FormStep::PickFile);
+        assert!(form.error.as_deref().unwrap_or_default().contains("archivo"));
+
+        app.on_paste("/no/existe/x.ovpn".to_string());
+        assert!(!app.advance_profile_step(), "una ruta inexistente tampoco");
+        assert_eq!(app.profile_form.as_ref().unwrap().step, FormStep::PickFile);
+    }
+
+    /// Editar no es alta: ahí se ven todos los campos juntos, como siempre.
+    #[test]
+    fn editar_un_perfil_muestra_todos_los_campos() {
+        let mut app = test_app();
+        let file = tmp_ovpn("vpn-tui-wizard-2.ovpn");
+        app.db.insert_openvpn_profile(Some("casa"), &file).unwrap();
+        app.reload_profiles();
+
+        app.open_profile_form_edit(Kind::OpenVpn, 0);
+        assert_eq!(app.profile_form.as_ref().unwrap().step, FormStep::All);
+        std::fs::remove_file(&file).ok();
+    }
+
+    /// En Forti el nombre va al final: primero los datos de conexión, igual que
+    /// en el asistente de OpenVPN3.
+    #[test]
+    fn forti_pide_el_nombre_al_final() {
+        let form = ProfileForm::new_forti(None);
+        assert_eq!(form.step, FormStep::All);
+        assert_eq!(form.fields[0].label, "host:puerto");
+        let last = form.fields.last().unwrap().label;
+        assert!(last.starts_with("nombre"), "el último campo es el nombre: {last}");
+        assert_eq!(form.fields.len() - 1, ProfileForm::FORTI_NAME);
+    }
+
+    #[test]
+    fn la_sugerencia_de_nombre_sale_del_nombre_del_archivo() {
+        assert_eq!(
+            suggested_profile_name(Path::new("/home/isaac/apps/vpns/thinkpad.ovpn")).as_deref(),
+            Some("thinkpad")
+        );
+        assert_eq!(suggested_profile_name(Path::new("/")), None);
+    }
+
+    /// El primer perfil puede quedarse sin nombre; el segundo del mismo tipo lo
+    /// exige, y la pantalla tiene que poder anunciarlo *antes* de guardar.
+    #[test]
+    fn el_nombre_es_obligatorio_desde_el_segundo_perfil_del_mismo_tipo() {
+        let mut app = test_app();
+        let file = tmp_ovpn("vpn-tui-wizard-3.ovpn");
+
+        app.open_profile_form_new(Kind::OpenVpn);
+        app.on_paste(file.to_string_lossy().into_owned());
+        assert!(app.advance_profile_step());
+        assert!(!app.name_required(), "el primero no necesita nombre");
+        assert!(app.save_profile_form(), "guarda sin nombre");
+        assert_eq!(app.openvpn_profiles.len(), 1);
+
+        // Segundo perfil del mismo tipo: ahora sí es obligatorio.
+        app.open_profile_form_new(Kind::OpenVpn);
+        app.on_paste(file.to_string_lossy().into_owned());
+        assert!(app.advance_profile_step());
+        assert!(app.name_required(), "la pantalla debe avisarlo desde el paso");
+        assert!(!app.save_profile_form(), "sin nombre no guarda");
+
+        insert_text(
+            &mut app.profile_form.as_mut().unwrap().fields[ProfileForm::OVPN_NAME].input,
+            "trabajo",
+        );
+        assert!(app.save_profile_form());
+        assert_eq!(app.openvpn_profiles.len(), 2);
+        std::fs::remove_file(&file).ok();
     }
 
     /// Soltar el .ovpn sobre el asistente abre el formulario ya con la ruta.
@@ -2327,7 +2623,7 @@ mod tests {
         let form = app.profile_form.as_ref().unwrap();
         assert_eq!(form.kind, Kind::OpenVpn);
         assert_eq!(form.origin, FormOrigin::Setup);
-        assert_eq!(form.fields[1].input.value(), file.to_string_lossy());
+        assert_eq!(form.fields[ProfileForm::OVPN_PATH].input.value(), file.to_string_lossy());
         std::fs::remove_file(&file).ok();
     }
 }
