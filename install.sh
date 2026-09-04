@@ -9,6 +9,7 @@
 #   /usr/local/bin/vpn                     binario
 #   /usr/local/libexec/vpn/ipv6-*.sh       scripts privilegiados (root:root)
 #   /usr/share/applications/vpn.desktop    entrada del lanzador
+#   /usr/share/icons/hicolor/512x512/apps/vpn.png   ícono de la app
 #   ~/.local/share/vpn-tui/vpn-tui.db      datos por usuario (no se toca)
 #
 # Soporta Fedora/RHEL-like (dnf) y Debian/Ubuntu-like (apt). El resto del
@@ -22,6 +23,8 @@ PREFIX="/usr/local"
 BIN_DIR="$PREFIX/bin"
 LIBEXEC_DIR="$PREFIX/libexec/vpn"
 DESKTOP_DIR="/usr/share/applications"
+ICON_THEME_DIR="/usr/share/icons/hicolor"
+ICON_DIR="$ICON_THEME_DIR/512x512/apps"
 SUDOERS_FILE="/etc/sudoers.d/vpn-tui"
 IPV6_DISABLE="$LIBEXEC_DIR/ipv6-disable.sh"
 IPV6_ENABLE="$LIBEXEC_DIR/ipv6-enable.sh"
@@ -198,6 +201,16 @@ install_scripts() {
   ok "scripts de IPv6 en $LIBEXEC_DIR (root:root)"
 }
 
+install_icon() {
+  local src="$HERE/assets/vpn.png"
+  [[ -f "$src" ]] || { warn "no encuentro assets/vpn.png; el lanzador usará el ícono por defecto del tema"; return 0; }
+  install -d -o root -g root -m 755 "$ICON_DIR"
+  install -o root -g root -m 644 "$src" "$ICON_DIR/vpn.png"
+  # Refresca el caché de íconos si la herramienta existe (no es crítica).
+  command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -f -t "$ICON_THEME_DIR" 2>/dev/null || true
+  ok "ícono en $ICON_DIR/vpn.png"
+}
+
 install_desktop() {
   local src="$HERE/vpn.desktop"
   [[ -f "$src" ]] || { warn "no encuentro vpn.desktop; omito la entrada del lanzador"; return 0; }
@@ -264,6 +277,7 @@ main() {
   build
   install_bin
   install_scripts
+  install_icon
   install_desktop
   disable_old_alias
   install_sudoers
