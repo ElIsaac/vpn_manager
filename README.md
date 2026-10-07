@@ -60,19 +60,48 @@ instalar.
 
 ## Requisitos
 
-- Linux con systemd, y Rust (`cargo`) para compilar. Si no lo tienes, el
-  instalador se ofrece a ponerlo con rustup.
-- Los clientes que vayas a usar (`openvpn3`, `openfortivpn`, `tailscale`): el
-  instalador los instala por ti, y solo necesitas los que uses.
+Solo **Linux con systemd** y `sudo`. Nada más: partiendo de un sistema recién
+instalado, `install.sh` se encarga de todo lo demás sin preguntar nada.
 
-Probado de punta a punta en **Fedora, Debian, Ubuntu y Kali**.
+- Herramientas de compilación (`curl`, `gnupg`, compilador de C, `make`,
+  `pkg-config`): las instala si faltan. El compilador de C no es opcional,
+  porque SQLite se compila embebido en el binario.
+- Rust: si no hay `cargo`, o el de la distro es más viejo que **1.89** (el MSRV
+  real de las dependencias: Ubuntu 24.04 trae 1.75 y 25.10 trae 1.85), instala
+  rustup con la toolchain `stable` para tu usuario. Si ya tienes Rust, respeta
+  lo que tengas: usa tu `cargo` si cumple el mínimo (aunque viva fuera de
+  `~/.cargo/bin`, p. ej. con nix, asdf, mise o `CARGO_HOME` movido), y si tu
+  toolchain de rustup se queda corta instala `stable` y compila con
+  `cargo +stable` **sin cambiar tu toolchain por omisión**.
+- Los clientes de VPN (`openvpn3`, `openfortivpn`, `tailscale`): los instala por
+  ti, y solo necesitas los que uses. Si uno no está disponible para tu distro,
+  avisa y sigue con el resto.
 
-> **Sobre `openvpn3` en Debian/Ubuntu**: el repo oficial del proyecto OpenVPN3
-> Linux solo publica paquetes para codenames antiguos (`bullseye`, `jammy`,
-> `focal`), no para `bookworm` ni `noble`. En Kali y en Debian sid/testing sí
-> existe el paquete nativo `openvpn3-client`, y el instalador lo prefiere. Si tu
-> versión no tiene ninguno de los dos, el instalador avisa y sigue: el resto
-> (FortiVPN, Tailscale) funciona igual.
+Probado de punta a punta en contenedores limpios (usuario normal +
+`sudo ./install.sh`, verificando que `vpn --status` corra después): **Ubuntu
+21.10 – 26.04** (las 10 últimas), **Debian 8 – 13, testing y sid**, **Fedora
+35 – 44** (las 10 últimas), **Kali** (rolling, last-release, dev, experimental,
+bleeding-edge) y **Linux Mint**. Compila e instala en las 36; en Debian 7 no,
+porque su glibc 2.13 es anterior al mínimo que soporta Rust (2.17).
+
+Lo que cambia entre distros no es el instalador, sino qué clientes de VPN hay
+disponibles: `openvpn3` falta en Fedora ≤ 42 (el COPR solo publica para 43 y 44,
+y todas las Fedora sin él están EOL) y en Debian ≤ 9, donde además tampoco hay
+`openfortivpn` ni `tailscale`. En esos casos el instalador avisa, sigue y deja
+la TUI funcionando con lo que sí exista.
+
+> **Sobre `openvpn3` en Debian/Ubuntu**: el instalador prueba tres fuentes en
+> orden — el paquete nativo `openvpn3-client` (Ubuntu 25.10+, Kali `main`,
+> Debian sid/testing), el repo APT oficial vigente `packages.openvpn.net`
+> (`noble`, `plucky`, `resolute`, `bookworm`, `trixie`) y el repo legacy
+> `swupdate.openvpn.net` (ya solo para codenames antiguos como `jammy` o
+> `focal`). Si tu release es intermedia y ninguna publica su codename (el caso
+> de Ubuntu 24.10 `oracular` o 22.10 `kinetic`), usa el paquete de la release
+> **anterior** más cercana que sí esté —`noble` y `jammy` respectivamente— y lo
+> dice en pantalla; nunca el de una posterior, que pediría librerías que tu
+> sistema no tiene. El mapa versión→codename sale de `distro-info-data`, no de
+> una lista dentro del script. Si aun así no hay paquete, avisa y sigue, y el
+> resto (FortiVPN, Tailscale) funciona igual.
 
 ## Instalación
 
